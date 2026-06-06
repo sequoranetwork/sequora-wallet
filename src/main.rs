@@ -16,8 +16,10 @@ use argon2::Argon2;
 use base64::Engine;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
+use cosmos_sdk_proto::cosmos::bank::v1beta1::MsgSend;
 use cosmos_sdk_proto::cosmos::base::v1beta1::Coin;
-use cosmos_sdk_proto::cosmos::staking::v1beta1::MsgDelegate;
+use cosmos_sdk_proto::cosmos::distribution::v1beta1::MsgWithdrawDelegatorReward;
+use cosmos_sdk_proto::cosmos::staking::v1beta1::{MsgDelegate, MsgUndelegate};
 use cosmos_sdk_proto::cosmos::tx::signing::v1beta1::SignMode;
 use cosmos_sdk_proto::cosmos::tx::v1beta1::{
     mode_info, AuthInfo, Fee, ModeInfo, SignDoc, SignerInfo, TxBody, TxRaw,
@@ -281,22 +283,63 @@ fn sign_and_broadcast(rest: &str, chain_id: &str, msg: Any, gas: u64, fee_usqr: 
     }
 }
 
+fn my_address() -> String {
+    derive_address(&load_pubkey()) // no password needed (pubkey is public)
+}
+
 fn cmd_stake(rest: &str, chain_id: &str, valoper: &str, amount: &str) {
-    let (pubkey, _) = load_keypair();
-    let from = derive_address(&pubkey);
     let msg = MsgDelegate {
-        delegator_address: from,
+        delegator_address: my_address(),
         validator_address: valoper.to_string(),
-        amount: Some(Coin {
-            denom: "usqr".into(),
-            amount: amount.to_string(),
-        }),
+        amount: Some(Coin { denom: "usqr".into(), amount: amount.to_string() }),
     };
     let any = Any {
         type_url: "/cosmos.staking.v1beta1.MsgDelegate".to_string(),
         value: msg.encode_to_vec(),
     };
     println!("ONE-TAP STAKE: delegating {amount} usqr -> {valoper}");
+    sign_and_broadcast(rest, chain_id, any, 500_000, 15_000);
+}
+
+fn cmd_send(rest: &str, chain_id: &str, to: &str, amount: &str) {
+    let msg = MsgSend {
+        from_address: my_address(),
+        to_address: to.to_string(),
+        amount: vec![Coin { denom: "usqr".into(), amount: amount.to_string() }],
+    };
+    let any = Any {
+        type_url: "/cosmos.bank.v1beta1.MsgSend".to_string(),
+        value: msg.encode_to_vec(),
+    };
+    println!("SEND: {amount} usqr -> {to}");
+    // PQC txs need more gas: the 1952-byte pubkey is written + ML-DSA verify (10x).
+    sign_and_broadcast(rest, chain_id, any, 400_000, 12_000);
+}
+
+fn cmd_claim(rest: &str, chain_id: &str, valoper: &str) {
+    let msg = MsgWithdrawDelegatorReward {
+        delegator_address: my_address(),
+        validator_address: valoper.to_string(),
+    };
+    let any = Any {
+        type_url: "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward".to_string(),
+        value: msg.encode_to_vec(),
+    };
+    println!("CLAIM staking rewards from {valoper}");
+    sign_and_broadcast(rest, chain_id, any, 300_000, 9_000);
+}
+
+fn cmd_unstake(rest: &str, chain_id: &str, valoper: &str, amount: &str) {
+    let msg = MsgUndelegate {
+        delegator_address: my_address(),
+        validator_address: valoper.to_string(),
+        amount: Some(Coin { denom: "usqr".into(), amount: amount.to_string() }),
+    };
+    let any = Any {
+        type_url: "/cosmos.staking.v1beta1.MsgUndelegate".to_string(),
+        value: msg.encode_to_vec(),
+    };
+    println!("UNSTAKE: undelegating {amount} usqr from {valoper}");
     sign_and_broadcast(rest, chain_id, any, 500_000, 15_000);
 }
 
@@ -313,6 +356,26 @@ fn main() {
             let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
             let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
             cmd_stake(rest, chain_id, valoper, amount);
+        }
+        "send" => {
+            let to = args.get(2).map(String::as_str).expect("usage: sqrwallet send <to_addr> <amount> [chain_id] [rest_url]");
+            let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet send <to_addr> <amount> [chain_id] [rest_url]");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
+            let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
+            cmd_send(rest, chain_id, to, amount);
+        }
+        "claim" => {
+            let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet claim <valoper> [chain_id] [rest_url]");
+            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-wasm");
+            let rest = args.get(4).map(String::as_str).unwrap_or("http://localhost:1317");
+            cmd_claim(rest, chain_id, valoper);
+        }
+        "unstake" => {
+            let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet unstake <valoper> <amount> [chain_id] [rest_url]");
+            let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet unstake <valoper> <amount> [chain_id] [rest_url]");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
+            let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
+            cmd_unstake(rest, chain_id, valoper, amount);
         }
         _ => {
             println!("Sequora wallet (Rust shared-core prototype)");
