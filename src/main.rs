@@ -12,7 +12,10 @@ use fips204::ml_dsa_65;
 use fips204::traits::{SerDes, Signer};
 use sha2::{Digest, Sha256};
 
+use argon2::Argon2;
 use base64::Engine;
+use chacha20poly1305::aead::Aead;
+use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use cosmos_sdk_proto::cosmos::base::v1beta1::Coin;
 use cosmos_sdk_proto::cosmos::staking::v1beta1::MsgDelegate;
 use cosmos_sdk_proto::cosmos::tx::signing::v1beta1::SignMode;
@@ -30,6 +33,27 @@ fn key_path() -> PathBuf {
     PathBuf::from(home).join(".sequora-wallet").join("key.json")
 }
 
+// --- key-at-rest encryption (Argon2id KDF + ChaCha20-Poly1305 AEAD) ---
+
+fn get_password() -> String {
+    env::var("SQRWALLET_PASSWORD")
+        .expect("set SQRWALLET_PASSWORD to unlock the wallet (a real wallet would prompt securely / use the OS keychain)")
+}
+
+fn rand_bytes(n: usize) -> Vec<u8> {
+    let mut b = vec![0u8; n];
+    getrandom::getrandom(&mut b).expect("rng");
+    b
+}
+
+fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+    let mut key = [0u8; 32];
+    Argon2::default()
+        .hash_password_into(password.as_bytes(), salt, &mut key)
+        .expect("argon2id");
+    key
+}
+
 // derive_address matches the chain: bech32("sqr", SHA256(pubkey)[:20]).
 fn derive_address(pubkey: &[u8]) -> String {
     let hash = Sha256::digest(pubkey);
@@ -44,27 +68,42 @@ fn load_pubkey() -> Vec<u8> {
 }
 
 fn cmd_new() {
+    let password = get_password();
     let (pk, sk) = ml_dsa_65::try_keygen().expect("keygen failed");
     let pk_bytes = pk.into_bytes();
     let sk_bytes = sk.into_bytes();
     let addr = derive_address(&pk_bytes);
+
+    // encrypt the private key at rest
+    let salt = rand_bytes(16);
+    let nonce = rand_bytes(12);
+    let key = derive_key(&password, &salt);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("cipher");
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), sk_bytes.as_ref())
+        .expect("encrypt");
 
     let dir = key_path().parent().unwrap().to_path_buf();
     fs::create_dir_all(&dir).unwrap();
     let json = serde_json::json!({
         "scheme": "ML-DSA-65",
         "pubkey": hex::encode(pk_bytes),
-        "privkey": hex::encode(sk_bytes),
         "address": addr,
+        "enc": {
+            "kdf": "argon2id",
+            "cipher": "chacha20poly1305",
+            "salt": hex::encode(&salt),
+            "nonce": hex::encode(&nonce),
+            "ciphertext": hex::encode(&ciphertext),
+        }
     });
     fs::write(key_path(), serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
-    println!("New Sequora wallet (post-quantum, ML-DSA-65 / FIPS 204)");
+    println!("New ENCRYPTED Sequora wallet (post-quantum, ML-DSA-65 / FIPS 204)");
     println!("  pubkey size : {} bytes", pk_bytes.len());
-    println!("  privkey size: {} bytes", sk_bytes.len());
     println!("  address     : {}", addr);
+    println!("  key at rest : Argon2id + ChaCha20-Poly1305 — private key NEVER stored in plaintext");
     println!("  saved to    : {}", key_path().display());
-    println!("\n(The 1952-byte quantum-proof pubkey is hidden behind the 20-byte address.)");
 }
 
 fn cmd_address() {
@@ -75,14 +114,9 @@ fn cmd_address() {
 // pubkey/message/signature as hex — so the chain (MsgVerifyPqc) can verify it,
 // proving Rust(fips204) <-> Go(circl) signature interop.
 fn cmd_sign(message: &str) {
-    let data = fs::read_to_string(key_path()).expect("no wallet — run `sqrwallet new`");
-    let v: serde_json::Value = serde_json::from_str(&data).expect("corrupt key file");
-    let sk_vec = hex::decode(v["privkey"].as_str().expect("privkey")).expect("hex");
-    let sk_arr: [u8; ml_dsa_65::SK_LEN] = sk_vec.try_into().expect("bad privkey length");
-    let sk = ml_dsa_65::PrivateKey::try_from_bytes(sk_arr).expect("load privkey");
+    let (pubkey, sk) = load_keypair(); // decrypts with SQRWALLET_PASSWORD
     let sig = sk.try_sign(message.as_bytes(), &[]).expect("sign"); // empty context
-    let pubkey = v["pubkey"].as_str().expect("pubkey");
-    println!("PUBKEY={}", pubkey);
+    println!("PUBKEY={}", hex::encode(&pubkey));
     println!("MESSAGE={}", message);
     println!("SIG={}", hex::encode(sig));
 }
@@ -120,7 +154,15 @@ fn load_keypair() -> (Vec<u8>, ml_dsa_65::PrivateKey) {
     let data = fs::read_to_string(key_path()).expect("no wallet — run `sqrwallet new`");
     let v: serde_json::Value = serde_json::from_str(&data).expect("corrupt key file");
     let pubkey = hex::decode(v["pubkey"].as_str().unwrap()).unwrap();
-    let sk_vec = hex::decode(v["privkey"].as_str().unwrap()).unwrap();
+    let enc = &v["enc"];
+    let salt = hex::decode(enc["salt"].as_str().expect("salt")).unwrap();
+    let nonce = hex::decode(enc["nonce"].as_str().expect("nonce")).unwrap();
+    let ct = hex::decode(enc["ciphertext"].as_str().expect("ciphertext")).unwrap();
+    let key = derive_key(&get_password(), &salt);
+    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("cipher");
+    let sk_vec = cipher
+        .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+        .expect("decrypt failed — wrong password?");
     let sk_arr: [u8; ml_dsa_65::SK_LEN] = sk_vec.try_into().expect("bad privkey length");
     let sk = ml_dsa_65::PrivateKey::try_from_bytes(sk_arr).expect("load privkey");
     (pubkey, sk)
