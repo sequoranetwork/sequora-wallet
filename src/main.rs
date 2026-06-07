@@ -21,7 +21,10 @@ use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 use cosmos_sdk_proto::cosmos::bank::v1beta1::MsgSend;
 use cosmos_sdk_proto::cosmos::base::v1beta1::Coin;
-use cosmos_sdk_proto::cosmos::distribution::v1beta1::MsgWithdrawDelegatorReward;
+use cosmos_sdk_proto::cosmos::distribution::v1beta1::{
+    MsgWithdrawDelegatorReward, MsgWithdrawValidatorCommission,
+};
+use cosmos_sdk_proto::cosmos::slashing::v1beta1::MsgUnjail;
 use cosmos_sdk_proto::cosmos::staking::v1beta1::{MsgDelegate, MsgUndelegate};
 use cosmos_sdk_proto::cosmos::tx::signing::v1beta1::SignMode;
 use cosmos_sdk_proto::cosmos::tx::v1beta1::{
@@ -78,6 +81,15 @@ fn derive_address(pubkey: &[u8]) -> String {
     let hash = Sha256::digest(pubkey);
     let addr20: [u8; 20] = hash[..20].try_into().unwrap();
     bech32::encode(HRP, addr20.to_base32(), Variant::Bech32).expect("bech32 encode")
+}
+
+// derive_valoper is the validator-operator address for THIS wallet: the same
+// 20-byte account hash, bech32-encoded with the "sqrvaloper" prefix (Cosmos
+// convention). It lets the wallet recognize a validator it operates.
+fn derive_valoper(pubkey: &[u8]) -> String {
+    let hash = Sha256::digest(pubkey);
+    let addr20: [u8; 20] = hash[..20].try_into().unwrap();
+    bech32::encode("sqrvaloper", addr20.to_base32(), Variant::Bech32).expect("bech32 encode")
 }
 
 fn load_pubkey() -> Vec<u8> {
@@ -472,14 +484,32 @@ fn info_json(rest: &str) -> String {
         .and_then(|c| c["amount"].as_str())
         .unwrap_or("0")
         .to_string();
-    let vals = rest_get(rest, "/cosmos/staking/v1beta1/validators?pagination.limit=100");
-    let validators: Vec<serde_json::Value> = vals["validators"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    let myvaloper = derive_valoper(&load_pubkey());
+    let vals = rest_get(rest, "/cosmos/staking/v1beta1/validators?pagination.limit=200");
+    let val_arr = vals["validators"].as_array().cloned().unwrap_or_default();
+    let validators: Vec<serde_json::Value> = val_arr
         .iter()
-        .map(|v| serde_json::json!({"moniker": v["description"]["moniker"], "valoper": v["operator_address"], "tokens": v["tokens"]}))
+        .map(|v| serde_json::json!({
+            "moniker": v["description"]["moniker"],
+            "valoper": v["operator_address"],
+            "tokens": v["tokens"],
+            "jailed": v["jailed"],
+            "status": v["status"],
+            "commission": v["commission"]["commission_rates"]["rate"],
+        }))
         .collect();
+    // Is THIS wallet operating a validator? (operator address == our valoper)
+    let myvalidator = match val_arr.iter().find(|v| v["operator_address"].as_str() == Some(myvaloper.as_str())) {
+        Some(v) => serde_json::json!({
+            "exists": true,
+            "moniker": v["description"]["moniker"],
+            "tokens": v["tokens"],
+            "jailed": v["jailed"],
+            "status": v["status"],
+            "commission": v["commission"]["commission_rates"]["rate"],
+        }),
+        None => serde_json::json!({"exists": false}),
+    };
     let dels = rest_get(rest, &format!("/cosmos/staking/v1beta1/delegations/{addr}"));
     let delegations: Vec<serde_json::Value> = dels["delegation_responses"]
         .as_array()
@@ -495,7 +525,7 @@ fn info_json(rest: &str) -> String {
         .and_then(|c| c["amount"].as_str())
         .map(|s| s.split('.').next().unwrap_or("0").to_string())
         .unwrap_or_else(|| "0".into());
-    serde_json::json!({"address": addr, "balance": balance, "rewards": rewards, "validators": validators, "delegations": delegations}).to_string()
+    serde_json::json!({"address": addr, "balance": balance, "rewards": rewards, "validators": validators, "delegations": delegations, "myvaloper": myvaloper, "myvalidator": myvalidator}).to_string()
 }
 
 fn api_action(body: &str, rest: &str, chain_id: &str, kind: &str) -> (u16, &'static str, String) {
@@ -525,6 +555,16 @@ fn api_action(body: &str, rest: &str, chain_id: &str, kind: &str) -> (u16, &'sta
                 validator_address: v["valoper"].as_str().unwrap_or("").to_string(),
             };
             (Any { type_url: "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward".into(), value: msg.encode_to_vec() }, 300_000, 9_000)
+        }
+        "unjail" => {
+            // Operator action: free your own validator after a downtime jail.
+            let msg = MsgUnjail { validator_addr: derive_valoper(&load_pubkey()) };
+            (Any { type_url: "/cosmos.slashing.v1beta1.MsgUnjail".into(), value: msg.encode_to_vec() }, 200_000, 6_000)
+        }
+        "withdrawcommission" => {
+            // Operator action: withdraw the commission your validator has earned.
+            let msg = MsgWithdrawValidatorCommission { validator_address: derive_valoper(&load_pubkey()) };
+            (Any { type_url: "/cosmos.distribution.v1beta1.MsgWithdrawValidatorCommission".into(), value: msg.encode_to_vec() }, 300_000, 9_000)
         }
         _ => return (400, "application/json", "{\"error\":\"unknown action\"}".into()),
     };
@@ -595,6 +635,8 @@ fn route(method: &tiny_http::Method, url: &str, body: &str, chain_id: &str, rest
         (tiny_http::Method::Post, "/api/send") => api_action(body, rest, chain_id, "send"),
         (tiny_http::Method::Post, "/api/stake") => api_action(body, rest, chain_id, "stake"),
         (tiny_http::Method::Post, "/api/claim") => api_action(body, rest, chain_id, "claim"),
+        (tiny_http::Method::Post, "/api/unjail") => api_action(body, rest, chain_id, "unjail"),
+        (tiny_http::Method::Post, "/api/withdraw-commission") => api_action(body, rest, chain_id, "withdrawcommission"),
         _ => (404, "text/plain", "not found".into()),
     }
 }
@@ -804,7 +846,7 @@ input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
    <div class="amt"><span id="bal">0</span> <small>SQR</small></div>
    <div class="addr" id="addr" onclick="copyAddr()" title="click to copy">…</div>
  </div>
- <div class="tabs"><div class="tab on" id="tw" onclick="tab('w')">Wallet</div><div class="tab" id="ts" onclick="tab('s')">Stake</div></div>
+ <div class="tabs"><div class="tab on" id="tw" onclick="tab('w')">Wallet</div><div class="tab" id="ts" onclick="tab('s')">Stake</div><div class="tab" id="tv" onclick="tab('v')">Validator</div></div>
  <div id="vw">
    <div class="card"><div class="asset"><div class="coin">SQR</div><div><div class="nm">Sequora</div><div class="sub">ML-DSA-65 · quantum-safe</div></div><div class="val"><span id="bal2">0</span><div class="sub">SQR</div></div></div></div>
    <div class="card"><h3>Send</h3>
@@ -816,6 +858,10 @@ input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
    <div class="card"><h3>Staking rewards</h3><div class="asset"><div class="coin" style="background:linear-gradient(135deg,#3ddc97,#2bb673)">★</div><div><div class="nm"><span id="rew">0</span> SQR</div><div class="sub">pending across delegations</div></div></div></div>
    <div class="card"><h3>Your delegations</h3><div id="dels"></div></div>
    <div class="card"><h3>Validators</h3><div id="vals"></div></div>
+ </div>
+ <div id="vval" class="hide">
+   <div class="card"><h3>My validator</h3><div id="myval"><div class="vs">loading…</div></div></div>
+   <div class="card"><h3>Network validators</h3><div id="netvals"></div></div>
  </div>
  <div class="foot">non-custodial · keys encrypted (Argon2id) · no backdoors</div>
 </div>
@@ -875,7 +921,7 @@ async function restore(){
 }
 ['click','keydown','touchstart'].forEach(e=>document.addEventListener(e,resetIdle));
 document.addEventListener('DOMContentLoaded',()=>{const i=$('lpw');if(i)i.addEventListener('input',()=>{const n=i.value.length;$('lcount').textContent=n?(n+' character'+(n==1?'':'s')):''})});
-function tab(t){$('vw').classList.toggle('hide',t!='w');$('vs2').classList.toggle('hide',t!='s');$('tw').classList.toggle('on',t=='w');$('ts').classList.toggle('on',t=='s')}
+function tab(t){$('vw').classList.toggle('hide',t!='w');$('vs2').classList.toggle('hide',t!='s');$('vval').classList.toggle('hide',t!='v');$('tw').classList.toggle('on',t=='w');$('ts').classList.toggle('on',t=='s');$('tv').classList.toggle('on',t=='v')}
 function copyAddr(){navigator.clipboard.writeText(ADDR);toast('ok','Address copied',ADDR)}
 function toast(k,h,m){let t=$('toast');t.className='show '+k;$('th').textContent=h;$('tm').textContent=m||'';setTimeout(()=>t.className=t.className.replace('show',''),4500)}
 async function refresh(){
@@ -892,6 +938,18 @@ async function refresh(){
   $('bal').textContent=sqr(d.balance);$('bal2').textContent=sqr(d.balance);$('rew').textContent=sqr(d.rewards);
   $('vals').innerHTML=d.validators.map(v=>`<div class="vrow"><div class="coin" style="width:34px;height:34px;font-size:11px">V</div><div><div class="vn">${esc(v.moniker)}</div><div class="vs">${sqr(v.tokens)} SQR staked</div></div><div style="margin-left:auto;display:flex;gap:6px"><input id="amt_${esc(v.valoper)}" placeholder="SQR" style="width:78px;padding:8px"><button class="btn sm" onclick="stake('${esc(v.valoper)}')">Stake</button></div></div>`).join('')||'<div class="vs">none</div>';
   $('dels').innerHTML=d.delegations.map(x=>`<div class="vrow"><div><div class="vn">${sqr(x.amount)} SQR</div><div class="vs">${esc(x.valoper).slice(0,20)}…</div></div><button class="btn sm alt" style="margin-left:auto" onclick="claim('${esc(x.valoper)}')">Claim</button></div>`).join('')||'<div class="vs">no delegations yet</div>';
+  // ---- Validator tab ----
+  const badge=s=>{const a=String(s||'');const on=a.includes('BONDED');return '<span style="font-size:10px;padding:3px 8px;border-radius:20px;background:'+(on?'rgba(80,220,140,.18)':'rgba(255,150,80,.18)')+';color:'+(on?'#5fe0a0':'#ffb070')+'">'+(on?'ACTIVE':(esc(a.replace('BOND_STATUS_',''))||'INACTIVE'))+'</span>'};
+  const mv=d.myvalidator||{exists:false};
+  if(mv.exists){
+    const jailed=mv.jailed===true;
+    const st=jailed?'<span style="color:#ff7a7a;font-size:11px">⚠ JAILED</span>':badge(mv.status);
+    $('myval').innerHTML='<div class="vrow"><div><div class="vn">'+esc(mv.moniker)+' '+st+'</div><div class="vs">'+sqr(mv.tokens)+' SQR bonded · commission '+(parseFloat(mv.commission||0)*100).toFixed(1)+'%</div></div></div>'
+      +'<div style="display:flex;gap:8px;margin-top:10px"><button class="btn sm" onclick="withdrawCommission()">Withdraw commission</button>'+(jailed?'<button class="btn sm alt" onclick="unjail()">Unjail</button>':'')+'</div>';
+  }else{
+    $('myval').innerHTML='<div class="vs">This wallet is not operating a validator.<br>To run one, use the setup wizard (<code>scripts/validator-wizard.sh</code>) — this wallet would be the operator key. Your valoper address:<br><span style="font-family:ui-monospace,monospace;font-size:10px">'+esc(d.myvaloper||'')+'</span></div>';
+  }
+  $('netvals').innerHTML=(d.validators||[]).map(function(v){var bs=v.jailed===true?'<span style="color:#ff7a7a;font-size:10px">JAILED</span>':badge(v.status);return '<div class="vrow"><div class="coin" style="width:30px;height:30px;font-size:10px">V</div><div><div class="vn">'+esc(v.moniker)+' '+bs+'</div><div class="vs">'+sqr(v.tokens)+' SQR · '+(parseFloat(v.commission||0)*100).toFixed(1)+'% commission</div></div></div>'}).join('')||'<div class="vs">none</div>';
 }
 async function post(path,obj,label){
   if(!PW){lock();return}
@@ -904,6 +962,8 @@ async function post(path,obj,label){
 function send(){post('/api/send',{to:$('sendTo').value,amount:usqr($('sendAmt').value)},'Send')}
 function stake(v){post('/api/stake',{valoper:v,amount:usqr($('amt_'+v).value)},'Stake')}
 function claim(v){post('/api/claim',{valoper:v},'Claim')}
+function unjail(){post('/api/unjail',{},'Unjail')}
+function withdrawCommission(){post('/api/withdraw-commission',{},'Withdraw commission')}
 $('lpw').focus(); // refresh starts only after unlock (see unlock())
 </script></body></html>"##;
 
