@@ -817,6 +817,13 @@ input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
 #lock input{text-align:center;font-size:15px;padding:13px}
 #lock .err{color:#ff7a7a;font-size:12px;min-height:16px;margin-top:12px}
 .lockbtn{cursor:pointer;user-select:none}
+#confirm{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:25;background:rgba(8,6,16,.72)}
+#confirm .box{width:100%;max-width:360px;background:#1a1730;border:1px solid rgba(255,255,255,.1);border-radius:18px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
+#confirm h3{font-size:16px;font-weight:800;margin-bottom:6px}
+#confirm .cfsub{font-size:12px;color:#9a96b8;margin-bottom:12px}
+.cfrow{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:13px}
+.cfrow:last-child{border:0}.cfrow span{color:#9a96b8;white-space:nowrap}.cfrow b{text-align:right;word-break:break-all;font-family:ui-monospace,monospace}
+#confirm .acts{display:flex;gap:10px;margin-top:16px}#confirm .acts .btn{flex:1;margin-top:0}
 </style></head><body>
 <div id="lock"><div class="box">
   <div class="logo">🛡️</div>
@@ -865,6 +872,12 @@ input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
  </div>
  <div class="foot">non-custodial · keys encrypted (Argon2id) · no backdoors</div>
 </div>
+<div id="confirm" class="hide"><div class="box">
+  <h3 id="cfTitle">Confirm transaction</h3>
+  <div class="cfsub">Review the details — this will be signed with your post-quantum key.</div>
+  <div id="cfRows"></div>
+  <div class="acts"><button class="btn alt" onclick="cancelConfirm()">Cancel</button><button class="btn" onclick="doConfirm()">Confirm &amp; sign</button></div>
+</div></div>
 <div id="toast"><div class="h" id="th"></div><div class="m" id="tm"></div></div>
 <script>
 const TOKEN='__CSRF_TOKEN__';
@@ -959,11 +972,30 @@ async function post(path,obj,label){
   else toast('ok',label+' sent ✓','tx '+(d.txhash||'').slice(0,28)+'…');
   setTimeout(refresh,3500);
 }
-function send(){post('/api/send',{to:$('sendTo').value,amount:usqr($('sendAmt').value)},'Send')}
-function stake(v){post('/api/stake',{valoper:v,amount:usqr($('amt_'+v).value)},'Stake')}
-function claim(v){post('/api/claim',{valoper:v},'Claim')}
-function unjail(){post('/api/unjail',{},'Unjail')}
-function withdrawCommission(){post('/api/withdraw-commission',{},'Withdraw commission')}
+// WYSIWYS: nothing is signed until the user sees the exact details and confirms.
+let pendingTx=null;
+function confirmTx(title,rows,path,obj){
+  if(!PW){lock();return}
+  $('cfTitle').textContent=title;
+  $('cfRows').innerHTML=rows.map(r=>'<div class="cfrow"><span>'+esc(r[0])+'</span><b>'+esc(r[1])+'</b></div>').join('');
+  pendingTx={path:path,obj:obj,label:title};
+  $('confirm').classList.remove('hide');
+}
+function cancelConfirm(){$('confirm').classList.add('hide');pendingTx=null}
+function doConfirm(){const t=pendingTx;pendingTx=null;$('confirm').classList.add('hide');if(t)post(t.path,t.obj,t.label)}
+function send(){
+  const to=$('sendTo').value.trim(),a=$('sendAmt').value.trim();
+  if(!to||!a){toast('err','Send','enter a recipient and amount');return}
+  confirmTx('Send SQR',[['To',to],['Amount',a+' SQR'],['Network fee','~0.012 SQR']],'/api/send',{to:to,amount:usqr(a)});
+}
+function stake(v){
+  const a=($('amt_'+v).value||'').trim();
+  if(!a){toast('err','Stake','enter an amount');return}
+  confirmTx('Stake (delegate)',[['Validator',v.slice(0,16)+'…'+v.slice(-6)],['Amount',a+' SQR'],['Network fee','~0.015 SQR']],'/api/stake',{valoper:v,amount:usqr(a)});
+}
+function claim(v){confirmTx('Claim staking rewards',[['From validator',v.slice(0,16)+'…'+v.slice(-6)],['Network fee','~0.009 SQR']],'/api/claim',{valoper:v})}
+function unjail(){confirmTx('Unjail your validator',[['Action','remove downtime jail'],['Network fee','~0.006 SQR']],'/api/unjail',{})}
+function withdrawCommission(){confirmTx('Withdraw validator commission',[['Action','withdraw earned commission'],['Network fee','~0.009 SQR']],'/api/withdraw-commission',{})}
 $('lpw').focus(); // refresh starts only after unlock (see unlock())
 </script></body></html>"##;
 
