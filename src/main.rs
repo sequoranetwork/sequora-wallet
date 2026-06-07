@@ -216,7 +216,7 @@ fn cmd_balance(rest: &str) {
         addr
     );
     println!("address: {}", addr);
-    match ureq::get(&url).call() {
+    match ureq::get(&url).timeout(std::time::Duration::from_secs(15)).call() {
         Ok(r) => {
             let body = r.into_string().unwrap_or_default();
             let v: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
@@ -308,6 +308,7 @@ fn query_account(rest: &str, addr: &str) -> (u64, u64) {
         addr
     );
     let body = ureq::get(&url)
+        .timeout(std::time::Duration::from_secs(15))
         .call()
         .expect("account query failed (is it funded?)")
         .into_string()
@@ -393,6 +394,7 @@ fn broadcast_msg(rest: &str, chain_id: &str, msg: Any, gas: u64, fee_usqr: u64, 
 
     let url = format!("{}/cosmos/tx/v1beta1/txs", rest.trim_end_matches('/'));
     let resp = ureq::post(&url)
+        .timeout(std::time::Duration::from_secs(20))
         .send_json(serde_json::json!({"tx_bytes": tx_b64, "mode": "BROADCAST_MODE_SYNC"}))
         .map_err(|e| format!("broadcast: {e}"))?;
     let v: serde_json::Value =
@@ -469,7 +471,7 @@ fn cmd_unstake(rest: &str, chain_id: &str, valoper: &str, amount: &str) {
 
 fn rest_get(rest: &str, path: &str) -> serde_json::Value {
     let url = format!("{}{}", rest.trim_end_matches('/'), path);
-    match ureq::get(&url).call() {
+    match ureq::get(&url).timeout(std::time::Duration::from_secs(15)).call() {
         Ok(r) => serde_json::from_str(&r.into_string().unwrap_or_default()).unwrap_or(serde_json::json!({})),
         Err(_) => serde_json::json!({}),
     }
@@ -690,7 +692,7 @@ fn load_or_create_token() -> String {
 
 fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
     let bind = format!("127.0.0.1:{port}"); // localhost only — never expose the signing API to the LAN
-    let server = tiny_http::Server::http(&bind).expect("bind");
+    let server = std::sync::Arc::new(tiny_http::Server::http(&bind).expect("bind"));
 
     // CSRF/auth defense (SECURITY finding C1): a token is embedded into the served
     // page and required on EVERY /api/* request via the X-Sequora-Token header. A
@@ -698,74 +700,88 @@ fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
     // it cannot learn the token, and the custom header forces a CORS preflight that
     // a cross-origin caller fails. Without this, any website could POST a signed
     // transaction to localhost. Persisted across restarts (see load_or_create_token).
-    let token = load_or_create_token();
-    let allowed_origins = [
+    let token = std::sync::Arc::new(load_or_create_token());
+    let allowed_origins = std::sync::Arc::new(vec![
         format!("http://localhost:{port}"),
         format!("http://127.0.0.1:{port}"),
-    ];
+    ]);
+    let chain_id = chain_id.to_string();
+    let rest = rest.to_string();
 
     println!("Sequora wallet UI running:");
     println!("  open  http://localhost:{port}  in your browser");
     println!("  chain {chain_id} via {rest}");
 
-    for mut req in server.incoming_requests() {
-        let method = req.method().clone();
-        let url = req.url().to_string();
-        let is_api = url.starts_with("/api/");
-
-        // Authorize API calls: valid session token + (if present) a localhost
-        // Origin. The token gate is the primary defense; the Origin check is
-        // belt-and-suspenders. GET / (the page itself) is public.
-        if is_api {
-            let tok_ok = header_value(&req, "X-Sequora-Token")
-                .map(|t| ct_eq(&t, &token))
-                .unwrap_or(false);
-            let origin_ok = match header_value(&req, "Origin") {
-                Some(o) => allowed_origins.iter().any(|a| ct_eq(a, &o)),
-                None => true, // same-origin GETs/POSTs may omit Origin
-            };
-            if !tok_ok || !origin_ok {
-                let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
-                let _ = req.respond(
-                    tiny_http::Response::from_string("{\"error\":\"forbidden\"}")
-                        .with_status_code(403)
-                        .with_header(h),
-                );
-                continue;
+    // Worker pool: handle requests concurrently so one slow chain-REST round-trip
+    // (or a slowloris client) can't block the whole UI. (SECURITY findings M3/M4.)
+    let workers = 8;
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let server = server.clone();
+        let token = token.clone();
+        let allowed = allowed_origins.clone();
+        let chain_id = chain_id.clone();
+        let rest = rest.clone();
+        handles.push(std::thread::spawn(move || loop {
+            match server.recv() {
+                Ok(req) => handle_request(req, &token, &allowed, &chain_id, &rest),
+                Err(_) => break,
             }
-        }
-
-        let mut body = String::new();
-        if method == tiny_http::Method::Post {
-            let _ = req.as_reader().read_to_string(&mut body);
-        }
-        let (status, ctype, mut out) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            route(&method, &url, &body, chain_id, rest)
-        }))
-        .unwrap_or((500, "application/json", "{\"error\":\"wrong password or internal error\"}".to_string()));
-
-        // Inject the session token into the page so the embedded JS can send it.
-        if url == "/" && ctype == "text/html" {
-            out = out.replace("__CSRF_TOKEN__", &token);
-        }
-
-        let mut resp = tiny_http::Response::from_string(out).with_status_code(status);
-        resp.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap());
-        // Never cache: the page carries a per-session CSRF token and security
-        // headers, and a stale cached copy was causing the UI to load old/broken
-        // script. Force a fresh fetch every load.
-        resp.add_header(tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store, must-revalidate"[..]).unwrap());
-        // A strict CSP: no inline-script injection vector beyond our own page,
-        // and the page can only talk back to itself. (SECURITY finding L4.)
-        resp.add_header(
-            tiny_http::Header::from_bytes(
-                &b"Content-Security-Policy"[..],
-                &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"[..],
-            )
-            .unwrap(),
-        );
-        let _ = req.respond(resp);
+        }));
     }
+    for h in handles {
+        let _ = h.join();
+    }
+}
+
+// Cap request bodies so a slowloris / oversized-body client can't tie up a worker
+// or exhaust memory. (SECURITY finding M4.)
+const MAX_BODY: u64 = 64 * 1024;
+
+// handle_request processes ONE request on a worker thread: auth (token + origin
+// for /api/*), size-capped body read, routing, and the security headers.
+fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[String], chain_id: &str, rest: &str) {
+    let method = req.method().clone();
+    let url = req.url().to_string();
+    let is_api = url.starts_with("/api/");
+    if is_api {
+        let tok_ok = header_value(&req, "X-Sequora-Token").map(|t| ct_eq(&t, token)).unwrap_or(false);
+        let origin_ok = match header_value(&req, "Origin") {
+            Some(o) => allowed_origins.iter().any(|a| ct_eq(a, &o)),
+            None => true, // same-origin GETs/POSTs may omit Origin
+        };
+        if !tok_ok || !origin_ok {
+            let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+            let _ = req.respond(
+                tiny_http::Response::from_string("{\"error\":\"forbidden\"}").with_status_code(403).with_header(h),
+            );
+            return;
+        }
+    }
+    let mut body = String::new();
+    if method == tiny_http::Method::Post {
+        let _ = req.as_reader().take(MAX_BODY).read_to_string(&mut body);
+    }
+    let (status, ctype, mut out) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        route(&method, &url, &body, chain_id, rest)
+    }))
+    .unwrap_or((500, "application/json", "{\"error\":\"wrong password or internal error\"}".to_string()));
+
+    if url == "/" && ctype == "text/html" {
+        out = out.replace("__CSRF_TOKEN__", token);
+    }
+
+    let mut resp = tiny_http::Response::from_string(out).with_status_code(status);
+    resp.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap());
+    resp.add_header(tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store, must-revalidate"[..]).unwrap());
+    resp.add_header(
+        tiny_http::Header::from_bytes(
+            &b"Content-Security-Policy"[..],
+            &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"[..],
+        )
+        .unwrap(),
+    );
+    let _ = req.respond(resp);
 }
 
 const DASHBOARD_HTML: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
