@@ -6,14 +6,16 @@
 use std::env;
 use std::fs;
 use std::io::Read;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use bech32::{ToBase32, Variant};
 use fips204::ml_dsa_65;
-use fips204::traits::{SerDes, Signer};
+use fips204::traits::{KeyGen, SerDes, Signer};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
 use chacha20poly1305::aead::Aead;
 use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
@@ -49,9 +51,23 @@ fn rand_bytes(n: usize) -> Vec<u8> {
     b
 }
 
-fn derive_key(password: &str, salt: &[u8]) -> [u8; 32] {
+// Hardened Argon2id parameters for NEW wallets (recorded in the key file so they
+// can be upgraded later). 64 MiB memory, 3 iterations, 1 lane — well above the
+// library default (~19 MiB / t=2), making offline cracking of an exfiltrated
+// key.json far more expensive. See SECURITY findings (H3).
+const ARGON2_M_COST: u32 = 65536; // KiB = 64 MiB
+const ARGON2_T_COST: u32 = 3;
+const ARGON2_P_COST: u32 = 1;
+// The library defaults, used as a fallback for wallets created before params
+// were recorded in the file (keeps older key.json files decryptable).
+const ARGON2_DEFAULT_M: u32 = 19456;
+const ARGON2_DEFAULT_T: u32 = 2;
+const ARGON2_DEFAULT_P: u32 = 1;
+
+fn derive_key(password: &str, salt: &[u8], m: u32, t: u32, p: u32) -> [u8; 32] {
     let mut key = [0u8; 32];
-    Argon2::default()
+    let params = Params::new(m, t, p, Some(32)).expect("argon2 params");
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
         .hash_password_into(password.as_bytes(), salt, &mut key)
         .expect("argon2id");
     key
@@ -70,43 +86,99 @@ fn load_pubkey() -> Vec<u8> {
     hex::decode(v["pubkey"].as_str().expect("missing pubkey")).expect("bad hex")
 }
 
-fn cmd_new() {
-    let password = get_password();
-    let (pk, sk) = ml_dsa_65::try_keygen().expect("keygen failed");
+// Derive the keypair from a 32-byte seed, encrypt the SEED at rest, and write
+// key.json (0600). The seed is all that's needed to regenerate the key — it is
+// exactly what the 24-word recovery phrase encodes. Returns the sqr1 address.
+fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> String {
+    let (pk, _sk) = ml_dsa_65::KG::keygen_from_seed(seed);
     let pk_bytes = pk.into_bytes();
-    let sk_bytes = sk.into_bytes();
     let addr = derive_address(&pk_bytes);
 
-    // encrypt the private key at rest
     let salt = rand_bytes(16);
     let nonce = rand_bytes(12);
-    let key = derive_key(&password, &salt);
+    let mut key = derive_key(password, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST);
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("cipher");
+    let mut seed_vec = seed.to_vec();
     let ciphertext = cipher
-        .encrypt(Nonce::from_slice(&nonce), sk_bytes.as_ref())
+        .encrypt(Nonce::from_slice(&nonce), seed_vec.as_ref())
         .expect("encrypt");
+    key.zeroize(); // scrub the derived key
+    seed_vec.zeroize(); // scrub the plaintext seed buffer
 
     let dir = key_path().parent().unwrap().to_path_buf();
-    fs::create_dir_all(&dir).unwrap();
+    // dir 0700: only the owner may traverse ~/.sequora-wallet
+    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
     let json = serde_json::json!({
         "scheme": "ML-DSA-65",
-        "pubkey": hex::encode(pk_bytes),
+        "pubkey": hex::encode(&pk_bytes),
         "address": addr,
         "enc": {
             "kdf": "argon2id",
             "cipher": "chacha20poly1305",
+            "m_cost": ARGON2_M_COST,
+            "t_cost": ARGON2_T_COST,
+            "p_cost": ARGON2_P_COST,
             "salt": hex::encode(&salt),
             "nonce": hex::encode(&nonce),
-            "ciphertext": hex::encode(&ciphertext),
+            "seed_ciphertext": hex::encode(&ciphertext),
         }
     });
-    fs::write(key_path(), serde_json::to_string_pretty(&json).unwrap()).unwrap();
+    // file 0600 from creation (no world-readable TOCTOU window). See finding H2.
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(key_path())
+        .unwrap();
+    use std::io::Write as _;
+    f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes()).unwrap();
+    addr
+}
+
+fn cmd_new() {
+    let password = get_password();
+    // 32 bytes of entropy = the FIPS-204 seed AND the 24-word recovery phrase.
+    let mut entropy = rand_bytes(32);
+    let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("mnemonic");
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&entropy);
+    let addr = save_wallet_from_seed(&seed, &password);
+    seed.zeroize();
+    entropy.zeroize();
 
     println!("New ENCRYPTED Sequora wallet (post-quantum, ML-DSA-65 / FIPS 204)");
-    println!("  pubkey size : {} bytes", pk_bytes.len());
+    println!();
+    println!("  ┌─ RECOVERY PHRASE (24 words) — WRITE THIS DOWN ON PAPER ─────────");
+    println!("  │  {}", mnemonic);
+    println!("  └─ Anyone with these words controls your funds. Store offline only:");
+    println!("     no photo, no cloud, no text file. This is the ONLY way to recover");
+    println!("     your wallet if this computer is lost.");
+    println!();
     println!("  address     : {}", addr);
-    println!("  key at rest : Argon2id + ChaCha20-Poly1305 — private key NEVER stored in plaintext");
+    println!("  key at rest : Argon2id + ChaCha20-Poly1305 (seed encrypted; key never stored in plaintext)");
     println!("  saved to    : {}", key_path().display());
+    println!("  restore     : sqrwallet restore   (with SQRWALLET_MNEMONIC + SQRWALLET_PASSWORD set)");
+}
+
+fn cmd_restore() {
+    let password = get_password();
+    let phrase = env::var("SQRWALLET_MNEMONIC")
+        .expect("set SQRWALLET_MNEMONIC to your 24-word recovery phrase (and SQRWALLET_PASSWORD to a new password)");
+    let mnemonic = bip39::Mnemonic::parse(phrase.trim())
+        .expect("invalid recovery phrase — check the words and their order");
+    let entropy = mnemonic.to_entropy();
+    if entropy.len() != 32 {
+        panic!("expected a 24-word recovery phrase");
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&entropy);
+    let addr = save_wallet_from_seed(&seed, &password);
+    seed.zeroize();
+
+    println!("Wallet restored from recovery phrase.");
+    println!("  address  : {}", addr);
+    println!("  saved to : {}", key_path().display());
 }
 
 fn cmd_address() {
@@ -160,14 +232,40 @@ fn load_keypair(pw: &str) -> (Vec<u8>, ml_dsa_65::PrivateKey) {
     let enc = &v["enc"];
     let salt = hex::decode(enc["salt"].as_str().expect("salt")).unwrap();
     let nonce = hex::decode(enc["nonce"].as_str().expect("nonce")).unwrap();
-    let ct = hex::decode(enc["ciphertext"].as_str().expect("ciphertext")).unwrap();
-    let key = derive_key(pw, &salt);
+    // Use the params recorded in the file; fall back to the library defaults for
+    // wallets created before params were stored (keeps old key.json decryptable).
+    let m = enc["m_cost"].as_u64().map(|v| v as u32).unwrap_or(ARGON2_DEFAULT_M);
+    let t = enc["t_cost"].as_u64().map(|v| v as u32).unwrap_or(ARGON2_DEFAULT_T);
+    let p = enc["p_cost"].as_u64().map(|v| v as u32).unwrap_or(ARGON2_DEFAULT_P);
+    let mut key = derive_key(pw, &salt, m, t, p);
     let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("cipher");
-    let sk_vec = cipher
-        .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
-        .expect("decrypt failed — wrong password?");
-    let sk_arr: [u8; ml_dsa_65::SK_LEN] = sk_vec.try_into().expect("bad privkey length");
-    let sk = ml_dsa_65::PrivateKey::try_from_bytes(sk_arr).expect("load privkey");
+
+    let sk = if let Some(seed_ct) = enc["seed_ciphertext"].as_str() {
+        // New seed-based wallet (has a recovery phrase): decrypt the 32-byte seed
+        // and re-derive the key deterministically.
+        let ct = hex::decode(seed_ct).unwrap();
+        let mut seed_vec = cipher
+            .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+            .expect("decrypt failed — wrong password?");
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&seed_vec);
+        seed_vec.zeroize();
+        let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&seed);
+        seed.zeroize();
+        sk
+    } else {
+        // Legacy wallet: the private key itself is encrypted (no recovery phrase).
+        let ct = hex::decode(enc["ciphertext"].as_str().expect("ciphertext")).unwrap();
+        let mut sk_vec = cipher
+            .decrypt(Nonce::from_slice(&nonce), ct.as_ref())
+            .expect("decrypt failed — wrong password?");
+        let mut sk_arr: [u8; ml_dsa_65::SK_LEN] = sk_vec.as_slice().try_into().expect("bad privkey length");
+        sk_vec.zeroize();
+        let sk = ml_dsa_65::PrivateKey::try_from_bytes(sk_arr).expect("load privkey");
+        sk_arr.zeroize();
+        sk
+    };
+    key.zeroize(); // scrub the derived key
     (pubkey, sk)
 }
 
@@ -390,7 +488,14 @@ fn info_json(rest: &str) -> String {
         .iter()
         .map(|d| serde_json::json!({"valoper": d["delegation"]["validator_address"], "amount": d["balance"]["amount"]}))
         .collect();
-    serde_json::json!({"address": addr, "balance": balance, "validators": validators, "delegations": delegations}).to_string()
+    let rew = rest_get(rest, &format!("/cosmos/distribution/v1beta1/delegators/{addr}/rewards"));
+    let rewards = rew["total"]
+        .as_array()
+        .and_then(|a| a.iter().find(|c| c["denom"] == "usqr"))
+        .and_then(|c| c["amount"].as_str())
+        .map(|s| s.split('.').next().unwrap_or("0").to_string())
+        .unwrap_or_else(|| "0".into());
+    serde_json::json!({"address": addr, "balance": balance, "rewards": rewards, "validators": validators, "delegations": delegations}).to_string()
 }
 
 fn api_action(body: &str, rest: &str, chain_id: &str, kind: &str) -> (u16, &'static str, String) {
@@ -429,10 +534,64 @@ fn api_action(body: &str, rest: &str, chain_id: &str, kind: &str) -> (u16, &'sta
     }
 }
 
+// verify_password checks that `pw` decrypts the key, WITHOUT retaining anything:
+// it decrypts, immediately drops (load_keypair zeroizes its buffers), and reports
+// only ok/fail. Used by the lock screen so the user gets "wrong password" feedback
+// at unlock time. The decrypted key is never held between requests.
+fn verify_password(pw: &str) -> bool {
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // silence the expected wrong-password panic
+    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = load_keypair(pw);
+    }))
+    .is_ok();
+    std::panic::set_hook(prev);
+    ok
+}
+
+fn api_unlock(body: &str) -> (u16, &'static str, String) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    let pw = v["password"].as_str().unwrap_or("");
+    if pw.is_empty() {
+        return (200, "application/json", "{\"ok\":false,\"error\":\"enter your password\"}".into());
+    }
+    if verify_password(pw) {
+        (200, "application/json", "{\"ok\":true}".into())
+    } else {
+        (200, "application/json", "{\"ok\":false,\"error\":\"wrong password\"}".into())
+    }
+}
+
+// Recover a wallet from a 24-word phrase. Re-derives the key from the seed and
+// writes a fresh key.json encrypted under the supplied (new) password.
+fn api_restore(body: &str) -> (u16, &'static str, String) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    let phrase = v["mnemonic"].as_str().unwrap_or("").trim().to_string();
+    let pw = v["password"].as_str().unwrap_or("");
+    if phrase.is_empty() || pw.is_empty() {
+        return (200, "application/json", "{\"ok\":false,\"error\":\"recovery phrase and a new password are both required\"}".into());
+    }
+    let mnemonic = match bip39::Mnemonic::parse(phrase) {
+        Ok(m) => m,
+        Err(_) => return (200, "application/json", "{\"ok\":false,\"error\":\"invalid recovery phrase — check the words and order\"}".into()),
+    };
+    let entropy = mnemonic.to_entropy();
+    if entropy.len() != 32 {
+        return (200, "application/json", "{\"ok\":false,\"error\":\"expected a 24-word recovery phrase\"}".into());
+    }
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&entropy);
+    let addr = save_wallet_from_seed(&seed, pw);
+    seed.zeroize();
+    (200, "application/json", serde_json::json!({"ok": true, "address": addr}).to_string())
+}
+
 fn route(method: &tiny_http::Method, url: &str, body: &str, chain_id: &str, rest: &str) -> (u16, &'static str, String) {
     match (method, url) {
         (tiny_http::Method::Get, "/") => (200, "text/html", DASHBOARD_HTML.to_string()),
         (tiny_http::Method::Get, "/api/info") => (200, "application/json", info_json(rest)),
+        (tiny_http::Method::Post, "/api/unlock") => api_unlock(body),
+        (tiny_http::Method::Post, "/api/restore") => api_restore(body),
         (tiny_http::Method::Post, "/api/send") => api_action(body, rest, chain_id, "send"),
         (tiny_http::Method::Post, "/api/stake") => api_action(body, rest, chain_id, "stake"),
         (tiny_http::Method::Post, "/api/claim") => api_action(body, rest, chain_id, "claim"),
@@ -440,89 +599,319 @@ fn route(method: &tiny_http::Method, url: &str, body: &str, chain_id: &str, rest
     }
 }
 
+// constant-time-ish comparison so the token check isn't a timing oracle.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
+fn header_value<'a>(req: &'a tiny_http::Request, name: &str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
+}
+
+// The CSRF token is persisted (0600) so server restarts/reboots don't invalidate
+// an already-open wallet page. It stays unguessable and is never readable by a
+// remote site (it lives on disk + is embedded only in the same-origin page), so
+// persisting it doesn't weaken the CSRF defense — it just makes the UI reliable.
+fn session_token_path() -> PathBuf {
+    key_path().parent().map(|d| d.join(".session_token")).unwrap_or_else(|| PathBuf::from(".session_token"))
+}
+
+fn load_or_create_token() -> String {
+    let p = session_token_path();
+    if let Ok(s) = fs::read_to_string(&p) {
+        let s = s.trim().to_string();
+        if s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit()) {
+            return s;
+        }
+    }
+    let tok = hex::encode(rand_bytes(32));
+    if let Some(dir) = p.parent() {
+        let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    }
+    if let Ok(mut f) = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&p) {
+        use std::io::Write as _;
+        let _ = f.write_all(tok.as_bytes());
+    }
+    tok
+}
+
 fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
-    let bind = format!("0.0.0.0:{port}");
+    let bind = format!("127.0.0.1:{port}"); // localhost only — never expose the signing API to the LAN
     let server = tiny_http::Server::http(&bind).expect("bind");
+
+    // CSRF/auth defense (SECURITY finding C1): a token is embedded into the served
+    // page and required on EVERY /api/* request via the X-Sequora-Token header. A
+    // malicious site the user visits cannot read this page (same-origin policy) so
+    // it cannot learn the token, and the custom header forces a CORS preflight that
+    // a cross-origin caller fails. Without this, any website could POST a signed
+    // transaction to localhost. Persisted across restarts (see load_or_create_token).
+    let token = load_or_create_token();
+    let allowed_origins = [
+        format!("http://localhost:{port}"),
+        format!("http://127.0.0.1:{port}"),
+    ];
+
     println!("Sequora wallet UI running:");
     println!("  open  http://localhost:{port}  in your browser");
     println!("  chain {chain_id} via {rest}");
+
     for mut req in server.incoming_requests() {
         let method = req.method().clone();
         let url = req.url().to_string();
+        let is_api = url.starts_with("/api/");
+
+        // Authorize API calls: valid session token + (if present) a localhost
+        // Origin. The token gate is the primary defense; the Origin check is
+        // belt-and-suspenders. GET / (the page itself) is public.
+        if is_api {
+            let tok_ok = header_value(&req, "X-Sequora-Token")
+                .map(|t| ct_eq(&t, &token))
+                .unwrap_or(false);
+            let origin_ok = match header_value(&req, "Origin") {
+                Some(o) => allowed_origins.iter().any(|a| ct_eq(a, &o)),
+                None => true, // same-origin GETs/POSTs may omit Origin
+            };
+            if !tok_ok || !origin_ok {
+                let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..]).unwrap();
+                let _ = req.respond(
+                    tiny_http::Response::from_string("{\"error\":\"forbidden\"}")
+                        .with_status_code(403)
+                        .with_header(h),
+                );
+                continue;
+            }
+        }
+
         let mut body = String::new();
         if method == tiny_http::Method::Post {
             let _ = req.as_reader().read_to_string(&mut body);
         }
-        let (status, ctype, out) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (status, ctype, mut out) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             route(&method, &url, &body, chain_id, rest)
         }))
         .unwrap_or((500, "application/json", "{\"error\":\"wrong password or internal error\"}".to_string()));
-        let header = tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap();
-        let _ = req.respond(tiny_http::Response::from_string(out).with_status_code(status).with_header(header));
+
+        // Inject the session token into the page so the embedded JS can send it.
+        if url == "/" && ctype == "text/html" {
+            out = out.replace("__CSRF_TOKEN__", &token);
+        }
+
+        let mut resp = tiny_http::Response::from_string(out).with_status_code(status);
+        resp.add_header(tiny_http::Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()).unwrap());
+        // Never cache: the page carries a per-session CSRF token and security
+        // headers, and a stale cached copy was causing the UI to load old/broken
+        // script. Force a fresh fetch every load.
+        resp.add_header(tiny_http::Header::from_bytes(&b"Cache-Control"[..], &b"no-store, must-revalidate"[..]).unwrap());
+        // A strict CSP: no inline-script injection vector beyond our own page,
+        // and the page can only talk back to itself. (SECURITY finding L4.)
+        resp.add_header(
+            tiny_http::Header::from_bytes(
+                &b"Content-Security-Policy"[..],
+                &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"[..],
+            )
+            .unwrap(),
+        );
+        let _ = req.respond(resp);
     }
 }
 
-const DASHBOARD_HTML: &str = r##"<!doctype html><html><head><meta charset="utf-8"><title>Sequora Wallet</title>
+const DASHBOARD_HTML: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sequora Wallet</title>
 <style>
- body{font-family:system-ui,sans-serif;max-width:760px;margin:24px auto;padding:0 16px;background:#0d1117;color:#e6edf3}
- h1{font-size:22px} h2{font-size:15px;color:#7ee787;margin-top:24px;border-bottom:1px solid #30363d;padding-bottom:4px}
- .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin:10px 0}
- .addr{font-family:monospace;font-size:12px;word-break:break-all;color:#58a6ff}
- .bal{font-size:28px;font-weight:700}
- input{background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:6px;padding:6px;margin:2px}
- button{background:#238636;color:#fff;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;font-weight:600}
- button:hover{background:#2ea043} .row{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin:4px 0}
- .muted{color:#8b949e;font-size:12px} #out{white-space:pre-wrap;font-family:monospace;font-size:12px;color:#d29922}
- .pill{background:#21262d;border-radius:20px;padding:2px 8px;font-size:11px;color:#8b949e}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'Inter',system-ui,sans-serif;min-height:100vh;color:#eceaf5;display:flex;justify-content:center;padding:28px 14px;
+ background:radial-gradient(1200px 600px at 50% -10%,#2a1f4d 0%,#14111f 55%,#0b0a12 100%)}
+.app{width:100%;max-width:440px}
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
+.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#8a5cff,#5b8dff);display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 4px 14px rgba(138,92,255,.45)}
+.net{font-size:11px;color:#a8a4c4;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);padding:4px 10px;border-radius:20px}
+.hero{background:linear-gradient(135deg,#7b5cff 0%,#5b8dff 100%);border-radius:22px;padding:22px;box-shadow:0 16px 40px rgba(91,141,255,.30);position:relative;overflow:hidden}
+.hero:after{content:"";position:absolute;right:-40px;top:-40px;width:160px;height:160px;border-radius:50%;background:rgba(255,255,255,.12)}
+.hero .lbl{font-size:12px;color:rgba(255,255,255,.85);font-weight:500}
+.hero .amt{font-size:38px;font-weight:800;letter-spacing:-1px;margin:4px 0 2px}
+.hero .amt small{font-size:18px;font-weight:600;opacity:.85}
+.hero .addr{font-size:11px;font-family:ui-monospace,monospace;color:rgba(255,255,255,.9);background:rgba(0,0,0,.18);padding:6px 10px;border-radius:10px;margin-top:12px;display:inline-flex;gap:8px;align-items:center;cursor:pointer}
+.tabs{display:flex;gap:6px;background:rgba(255,255,255,.05);border-radius:14px;padding:5px;margin:18px 0}
+.tab{flex:1;text-align:center;padding:9px;border-radius:10px;font-weight:600;font-size:14px;color:#a8a4c4;cursor:pointer}
+.tab.on{background:linear-gradient(135deg,#8a5cff,#5b8dff);color:#fff;box-shadow:0 4px 12px rgba(138,92,255,.4)}
+.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;margin-bottom:12px}
+.card h3{font-size:12px;color:#bdb8da;font-weight:600;margin-bottom:10px;text-transform:uppercase;letter-spacing:.6px}
+.asset{display:flex;align-items:center;gap:12px}
+.coin{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#8a5cff,#5b8dff);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;color:#fff}
+.asset .nm{font-weight:600}.asset .sub{font-size:12px;color:#9a96b8}.asset .val{margin-left:auto;text-align:right;font-weight:700}
+label{font-size:12px;color:#9a96b8;display:block;margin:10px 0 4px}
+input{width:100%;background:rgba(0,0,0,.25);color:#eceaf5;border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:11px 12px;font-size:14px;font-family:inherit;outline:none}
+input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
+.btn{width:100%;background:linear-gradient(135deg,#8a5cff,#5b8dff);color:#fff;border:0;border-radius:12px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-top:12px;transition:transform .08s,box-shadow .2s;box-shadow:0 6px 18px rgba(123,92,255,.35)}
+.btn:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(123,92,255,.5)}
+.btn.sm{width:auto;padding:8px 14px;margin:0;font-size:13px}.btn.alt{background:rgba(255,255,255,.09);box-shadow:none}
+.vrow{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}.vrow:last-child{border:0}
+.vrow .vn{font-weight:600;font-size:14px}.vrow .vs{font-size:11px;color:#9a96b8}
+.unlock{display:flex;gap:8px;align-items:center;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:6px 12px;margin-bottom:12px}
+.unlock input{border:0;background:transparent;padding:7px;box-shadow:none}
+.foot{text-align:center;font-size:11px;color:#6f6b8c;margin-top:18px}.hide{display:none!important}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(90px);background:#1c1830;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:13px 18px;max-width:400px;box-shadow:0 12px 40px rgba(0,0,0,.5);transition:transform .35s;z-index:9}
+#toast.show{transform:translateX(-50%) translateY(0)}
+#toast.ok{border-color:rgba(80,220,140,.55)}#toast.err{border-color:rgba(255,90,90,.55)}
+#toast .h{font-weight:700;margin-bottom:3px;font-size:13px}#toast .m{color:#a8a4c4;font-family:ui-monospace,monospace;font-size:11px;word-break:break-all}
+#lock{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:20;
+ background:radial-gradient(1200px 600px at 50% -10%,#2a1f4d 0%,#14111f 55%,#0b0a12 100%)}
+#lock .box{width:100%;max-width:360px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:32px 26px;text-align:center;box-shadow:0 16px 50px rgba(0,0,0,.45)}
+#lock .logo{width:56px;height:56px;border-radius:16px;margin:0 auto 16px;font-size:28px}
+#lock h1{font-size:21px;font-weight:800;letter-spacing:-.5px}
+#lock .tag{font-size:12px;color:#9a96b8;margin:4px 0 22px}
+#lock input{text-align:center;font-size:15px;padding:13px}
+#lock .err{color:#ff7a7a;font-size:12px;min-height:16px;margin-top:12px}
+.lockbtn{cursor:pointer;user-select:none}
 </style></head><body>
-<h1>🛡️ Sequora Wallet <span class="pill">post-quantum · ML-DSA-65</span></h1>
-<div class="card">
-  <div class="muted">your address</div>
-  <div class="addr" id="addr">…</div>
-  <div class="bal"><span id="bal">…</span> <span class="muted" style="font-size:14px">SQR</span></div>
-</div>
-<div class="card">
-  <div class="muted">password (to sign — unlocks your encrypted key)</div>
-  <input id="pw" type="password" placeholder="wallet password" style="width:280px">
-</div>
-<h2>Send</h2>
-<div class="card"><div class="row">
-  <input id="sendTo" placeholder="sqr1… recipient" style="width:320px">
-  <input id="sendAmt" placeholder="amount (usqr)" style="width:140px">
-  <button onclick="send()">Send</button>
+<div id="lock"><div class="box">
+  <div class="logo">🛡️</div>
+  <h1>Sequora</h1>
+  <div class="tag">post-quantum wallet · enter your password to unlock</div>
+  <div style="position:relative">
+    <input id="lpw" type="password" placeholder="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" onkeydown="if(event.key==='Enter')unlock()">
+    <span id="eye" onclick="toggleEye()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;user-select:none;font-size:15px;opacity:.65" title="show / hide">👁</span>
+  </div>
+  <div id="lcount" style="font-size:11px;color:#6f6b8c;margin-top:6px;min-height:14px"></div>
+  <button class="btn" onclick="unlock()">Unlock</button>
+  <div class="err" id="lerr"></div>
+  <div id="reclink" onclick="showRec()" style="font-size:12px;color:#8a8fb8;margin-top:16px;cursor:pointer">↩ Recover a wallet from your 24-word phrase</div>
+  <div id="rec" class="hide" style="margin-top:14px;text-align:left">
+    <label style="font-size:12px;color:#9a96b8;display:block;margin-bottom:4px">24-word recovery phrase</label>
+    <textarea id="rphrase" rows="3" placeholder="word1 word2 word3 …" style="width:100%;background:rgba(0,0,0,.25);color:#eceaf5;border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:11px 12px;font-size:13px;font-family:ui-monospace,monospace;resize:vertical;outline:none"></textarea>
+    <label style="font-size:12px;color:#9a96b8;display:block;margin:10px 0 4px">New password for this device</label>
+    <input id="rpw" type="password" placeholder="set a password" autocomplete="off">
+    <label style="font-size:11px;color:#9a96b8;display:flex;gap:7px;margin-top:10px;align-items:flex-start"><input type="checkbox" id="rack" style="width:auto;margin-top:2px"><span>I understand this replaces any wallet currently stored on this device.</span></label>
+    <button class="btn" onclick="restore()">Restore wallet</button>
+  </div>
 </div></div>
-<h2>Stake to a validator</h2>
-<div class="card" id="vals">…</div>
-<h2>Your delegations</h2>
-<div class="card" id="dels">…</div>
-<h2>Result</h2>
-<div class="card"><div id="out">—</div></div>
+<div class="app hide" id="app">
+ <div class="top"><div class="brand"><div class="logo">🛡️</div>Sequora</div><div style="display:flex;gap:8px;align-items:center"><div class="net">● sequora-wasm</div><div class="net lockbtn" onclick="lock()">🔒 Lock</div></div></div>
+ <div class="hero">
+   <div class="lbl">Total balance · post-quantum secured</div>
+   <div class="amt"><span id="bal">0</span> <small>SQR</small></div>
+   <div class="addr" id="addr" onclick="copyAddr()" title="click to copy">…</div>
+ </div>
+ <div class="tabs"><div class="tab on" id="tw" onclick="tab('w')">Wallet</div><div class="tab" id="ts" onclick="tab('s')">Stake</div></div>
+ <div id="vw">
+   <div class="card"><div class="asset"><div class="coin">SQR</div><div><div class="nm">Sequora</div><div class="sub">ML-DSA-65 · quantum-safe</div></div><div class="val"><span id="bal2">0</span><div class="sub">SQR</div></div></div></div>
+   <div class="card"><h3>Send</h3>
+     <label>Recipient address</label><input id="sendTo" placeholder="sqr1…">
+     <label>Amount (SQR)</label><input id="sendAmt" placeholder="0.00" inputmode="decimal">
+     <button class="btn" onclick="send()">Send SQR</button></div>
+ </div>
+ <div id="vs2" class="hide">
+   <div class="card"><h3>Staking rewards</h3><div class="asset"><div class="coin" style="background:linear-gradient(135deg,#3ddc97,#2bb673)">★</div><div><div class="nm"><span id="rew">0</span> SQR</div><div class="sub">pending across delegations</div></div></div></div>
+   <div class="card"><h3>Your delegations</h3><div id="dels"></div></div>
+   <div class="card"><h3>Validators</h3><div id="vals"></div></div>
+ </div>
+ <div class="foot">non-custodial · keys encrypted (Argon2id) · no backdoors</div>
+</div>
+<div id="toast"><div class="h" id="th"></div><div class="m" id="tm"></div></div>
 <script>
-function pw(){return document.getElementById('pw').value}
-function show(o){document.getElementById('out').textContent=JSON.stringify(o,null,2)}
-async function refresh(){
-  let r=await fetch('/api/info'); let d=await r.json();
-  document.getElementById('addr').textContent=d.address;
-  document.getElementById('bal').textContent=(parseInt(d.balance||0)/1e6).toLocaleString();
-  let vh=d.validators.map(v=>`<div class="row"><b>${v.moniker}</b> <span class="muted">${(v.tokens/1e6).toLocaleString()} SQR</span>
-    <input id="amt_${v.valoper}" placeholder="usqr" style="width:120px">
-    <button onclick="stake('${v.valoper}')">Stake</button></div>`).join('')||'<span class="muted">none</span>';
-  document.getElementById('vals').innerHTML=vh;
-  let dh=d.delegations.map(x=>`<div class="row"><span class="muted">${x.valoper.slice(0,24)}…</span> <b>${(x.amount/1e6).toLocaleString()} SQR</b>
-    <button onclick="claim('${x.valoper}')">Claim rewards</button></div>`).join('')||'<span class="muted">none yet</span>';
-  document.getElementById('dels').innerHTML=dh;
+const TOKEN='__CSRF_TOKEN__';
+const $=id=>document.getElementById(id);
+const sqr=u=>(parseInt(u||0)/1e6).toLocaleString(undefined,{maximumFractionDigits:6});
+const usqr=s=>Math.round(parseFloat(s||'0')*1e6).toString();
+// HTML-escape on-chain data (e.g. validator monikers) before it touches innerHTML.
+// This is the real XSS defense — without it a validator could set a moniker like
+// "<img onerror=...>" and run script that reads your in-memory password.
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// SECURITY: the password lives ONLY in this in-memory variable for the unlocked
+// session — never localStorage/cookie/sessionStorage. It is wiped on lock, on
+// idle timeout, and never survives a refresh. The server still decrypts the key
+// per-action and zeroizes it; nothing keeps the key unlocked between requests.
+let PW='';let ADDR='';let idleTimer=null;let started=false;let intv=null;
+const IDLE_MS=5*60*1000; // auto-lock after 5 min of inactivity
+function resetIdle(){clearTimeout(idleTimer);if(PW)idleTimer=setTimeout(lock,IDLE_MS)}
+async function unlock(){
+  // Trim surrounding whitespace — pasting a password often drags along a trailing
+  // space or newline, which would otherwise be a "wrong password" with no clue why.
+  const p=$('lpw').value.trim();
+  console.log('[unlock] clicked; password length =',p.length);
+  if(!p){$('lerr').textContent='enter your password';return}
+  $('lerr').textContent='unlocking…';
+  try{
+    const resp=await fetch('/api/unlock',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({password:p})});
+    console.log('[unlock] HTTP status =',resp.status);
+    const r=await resp.json();
+    console.log('[unlock] server reply =',r);
+    if(r.ok){PW=p;$('lpw').value='';$('lerr').textContent='';
+      $('lock').classList.add('hide');$('app').classList.remove('hide');
+      if(!started){started=true;refresh();intv=setInterval(refresh,15000)}else{refresh()}
+      resetIdle();
+    }else{$('lerr').textContent=(r.error||'wrong password')+' (HTTP '+resp.status+')';$('lpw').select()}
+  }catch(e){console.log('[unlock] fetch error',e);$('lerr').textContent='could not reach wallet: '+e}
 }
-async function post(path,obj){obj.password=pw(); let r=await fetch(path,{method:'POST',body:JSON.stringify(obj)}); let d=await r.json(); show(d); setTimeout(refresh,3000); return d}
-function send(){post('/api/send',{to:document.getElementById('sendTo').value,amount:document.getElementById('sendAmt').value})}
-function stake(v){post('/api/stake',{valoper:v,amount:document.getElementById('amt_'+v).value})}
-function claim(v){post('/api/claim',{valoper:v})}
-refresh();
+function lock(){PW='';clearTimeout(idleTimer);$('app').classList.add('hide');$('lock').classList.remove('hide');$('lpw').value='';$('lcount').textContent='';$('lpw').focus()}
+function toggleEye(){const i=$('lpw');i.type=i.type==='password'?'text':'password'}
+function showRec(){$('rec').classList.toggle('hide')}
+async function restore(){
+  const ph=$('rphrase').value.trim().replace(/\s+/g,' '), rp=$('rpw').value;
+  if(!ph){$('lerr').textContent='enter your 24-word recovery phrase';return}
+  if(!rp){$('lerr').textContent='set a password for this device';return}
+  if(!$('rack').checked){$('lerr').textContent='please tick the confirmation box';return}
+  $('lerr').textContent='restoring…';
+  try{
+    const r=await (await fetch('/api/restore',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({mnemonic:ph,password:rp})})).json();
+    if(r.ok){PW=rp;$('rphrase').value='';$('rpw').value='';$('rack').checked=false;$('lerr').textContent='';
+      $('lock').classList.add('hide');$('app').classList.remove('hide');
+      if(!started){started=true;refresh();intv=setInterval(refresh,15000)}else{refresh()}
+      resetIdle();toast('ok','Wallet restored ✓',r.address||'');
+    }else{$('lerr').textContent=r.error||'restore failed'}
+  }catch(e){$('lerr').textContent='could not reach wallet'}
+}
+['click','keydown','touchstart'].forEach(e=>document.addEventListener(e,resetIdle));
+document.addEventListener('DOMContentLoaded',()=>{const i=$('lpw');if(i)i.addEventListener('input',()=>{const n=i.value.length;$('lcount').textContent=n?(n+' character'+(n==1?'':'s')):''})});
+function tab(t){$('vw').classList.toggle('hide',t!='w');$('vs2').classList.toggle('hide',t!='s');$('tw').classList.toggle('on',t=='w');$('ts').classList.toggle('on',t=='s')}
+function copyAddr(){navigator.clipboard.writeText(ADDR);toast('ok','Address copied',ADDR)}
+function toast(k,h,m){let t=$('toast');t.className='show '+k;$('th').textContent=h;$('tm').textContent=m||'';setTimeout(()=>t.className=t.className.replace('show',''),4500)}
+async function refresh(){
+  let resp=await fetch('/api/info',{headers:{'X-Sequora-Token':TOKEN}});
+  if(!resp.ok){ // stale token / forbidden — stop hammering and reload a fresh page
+    if(intv){clearInterval(intv);intv=null}
+    console.log('[refresh] /api/info HTTP',resp.status,'- reloading for a fresh token');
+    toast('err','Session expired','reloading…');setTimeout(()=>location.reload(),900);return;
+  }
+  let d=await resp.json();
+  if(!d||!d.address){return}
+  ADDR=d.address;
+  $('addr').innerHTML=d.address.slice(0,14)+'…'+d.address.slice(-6)+' ⧉';
+  $('bal').textContent=sqr(d.balance);$('bal2').textContent=sqr(d.balance);$('rew').textContent=sqr(d.rewards);
+  $('vals').innerHTML=d.validators.map(v=>`<div class="vrow"><div class="coin" style="width:34px;height:34px;font-size:11px">V</div><div><div class="vn">${esc(v.moniker)}</div><div class="vs">${sqr(v.tokens)} SQR staked</div></div><div style="margin-left:auto;display:flex;gap:6px"><input id="amt_${esc(v.valoper)}" placeholder="SQR" style="width:78px;padding:8px"><button class="btn sm" onclick="stake('${esc(v.valoper)}')">Stake</button></div></div>`).join('')||'<div class="vs">none</div>';
+  $('dels').innerHTML=d.delegations.map(x=>`<div class="vrow"><div><div class="vn">${sqr(x.amount)} SQR</div><div class="vs">${esc(x.valoper).slice(0,20)}…</div></div><button class="btn sm alt" style="margin-left:auto" onclick="claim('${esc(x.valoper)}')">Claim</button></div>`).join('')||'<div class="vs">no delegations yet</div>';
+}
+async function post(path,obj,label){
+  if(!PW){lock();return}
+  obj.password=PW;
+  let d=await (await fetch(path,{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(obj)})).json();
+  if(d.error||(d.code&&d.code!=0))toast('err',label+' failed',d.error||d.log||('code '+d.code));
+  else toast('ok',label+' sent ✓','tx '+(d.txhash||'').slice(0,28)+'…');
+  setTimeout(refresh,3500);
+}
+function send(){post('/api/send',{to:$('sendTo').value,amount:usqr($('sendAmt').value)},'Send')}
+function stake(v){post('/api/stake',{valoper:v,amount:usqr($('amt_'+v).value)},'Stake')}
+function claim(v){post('/api/claim',{valoper:v},'Claim')}
+$('lpw').focus(); // refresh starts only after unlock (see unlock())
 </script></body></html>"##;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args.get(1).map(String::as_str).unwrap_or("help") {
         "new" => cmd_new(),
+        "restore" => cmd_restore(),
         "address" => cmd_address(),
         "balance" => cmd_balance(args.get(2).map(String::as_str).unwrap_or("http://localhost:1317")),
         "sign" => cmd_sign(args.get(2).map(String::as_str).unwrap_or("hello-sequora")),
@@ -561,7 +950,8 @@ fn main() {
         }
         _ => {
             println!("Sequora wallet (Rust shared-core prototype)");
-            println!("  sqrwallet new                 generate an ML-DSA-65 key + sqr1 address");
+            println!("  sqrwallet new                 generate a wallet + 24-word recovery phrase");
+            println!("  sqrwallet restore             recover a wallet (SQRWALLET_MNEMONIC + SQRWALLET_PASSWORD)");
             println!("  sqrwallet address             print this wallet's address");
             println!("  sqrwallet balance [rest_url]  query balance (default http://localhost:1317)");
         }
