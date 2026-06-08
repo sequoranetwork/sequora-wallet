@@ -106,6 +106,13 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> String {
     let pk_bytes = pk.into_bytes();
     let addr = derive_address(&pk_bytes);
 
+    // Never silently destroy an existing wallet: if key.json is present, back it
+    // up (0600 perms are preserved by the copy) before overwriting. A mistaken
+    // `new`/restore is then recoverable. (audit: destructive /api/restore)
+    if key_path().exists() {
+        let _ = fs::copy(key_path(), key_path().with_extension("json.bak"));
+    }
+
     let salt = rand_bytes(16);
     let nonce = rand_bytes(12);
     let mut key = derive_key(password, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST);
@@ -581,14 +588,13 @@ fn api_action(body: &str, rest: &str, chain_id: &str, kind: &str) -> (u16, &'sta
 // only ok/fail. Used by the lock screen so the user gets "wrong password" feedback
 // at unlock time. The decrypted key is never held between requests.
 fn verify_password(pw: &str) -> bool {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {})); // silence the expected wrong-password panic
-    let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // The quiet panic hook is installed ONCE at server startup (see cmd_serve).
+    // We must NOT mutate the global hook per-request — that raced across the 8
+    // worker threads. Here we only catch the expected wrong-password panic.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = load_keypair(pw);
     }))
-    .is_ok();
-    std::panic::set_hook(prev);
-    ok
+    .is_ok()
 }
 
 fn api_unlock(body: &str) -> (u16, &'static str, String) {
@@ -711,6 +717,11 @@ fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
     println!("Sequora wallet UI running:");
     println!("  open  http://localhost:{port}  in your browser");
     println!("  chain {chain_id} via {rest}");
+
+    // Install a quiet panic hook ONCE before spawning workers (each request is
+    // wrapped in catch_unwind). Avoids per-request global-hook mutation racing
+    // across worker threads. (audit: panic-hook race)
+    std::panic::set_hook(Box::new(|_| {}));
 
     // Worker pool: handle requests concurrently so one slow chain-REST round-trip
     // (or a slowloris client) can't block the whole UI. (SECURITY findings M3/M4.)
