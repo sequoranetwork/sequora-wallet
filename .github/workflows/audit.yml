@@ -1,0 +1,19 @@
+# Dependency vulnerability gate for the wallet. Fails on a known-vulnerable Rust
+# crate (RustSec advisory DB). The wallet compiles crypto crates straight into the
+# signing binary, so a poisoned/abandoned crate is a real supply-chain risk. Make
+# this a required check in branch protection. (threat-model: build-time supply chain)
+# NOTE: pin actions to full commit SHAs before mainnet.
+name: audit
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  cargo-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: cargo audit
+        run: cargo audit

@@ -926,20 +926,17 @@ async function unlock(){
   // Trim surrounding whitespace — pasting a password often drags along a trailing
   // space or newline, which would otherwise be a "wrong password" with no clue why.
   const p=$('lpw').value.trim();
-  console.log('[unlock] clicked; password length =',p.length);
   if(!p){$('lerr').textContent='enter your password';return}
   $('lerr').textContent='unlocking…';
   try{
     const resp=await fetch('/api/unlock',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({password:p})});
-    console.log('[unlock] HTTP status =',resp.status);
     const r=await resp.json();
-    console.log('[unlock] server reply =',r);
     if(r.ok){PW=p;$('lpw').value='';$('lerr').textContent='';
       $('lock').classList.add('hide');$('app').classList.remove('hide');
       if(!started){started=true;refresh();intv=setInterval(refresh,15000)}else{refresh()}
       resetIdle();
-    }else{$('lerr').textContent=(r.error||'wrong password')+' (HTTP '+resp.status+')';$('lpw').select()}
-  }catch(e){console.log('[unlock] fetch error',e);$('lerr').textContent='could not reach wallet: '+e}
+    }else{$('lerr').textContent=r.error||'wrong password';$('lpw').select()}
+  }catch(e){$('lerr').textContent='could not reach wallet'}
 }
 function lock(){PW='';clearTimeout(idleTimer);$('app').classList.add('hide');$('lock').classList.remove('hide');$('lpw').value='';$('lcount').textContent='';$('lpw').focus()}
 function toggleEye(){const i=$('lpw');i.type=i.type==='password'?'text':'password'}
@@ -968,7 +965,6 @@ async function refresh(){
   let resp=await fetch('/api/info',{headers:{'X-Sequora-Token':TOKEN}});
   if(!resp.ok){ // stale token / forbidden — stop hammering and reload a fresh page
     if(intv){clearInterval(intv);intv=null}
-    console.log('[refresh] /api/info HTTP',resp.status,'- reloading for a fresh token');
     toast('err','Session expired','reloading…');setTimeout(()=>location.reload(),900);return;
   }
   let d=await resp.json();
