@@ -106,7 +106,7 @@ fn load_pubkey() -> Vec<u8> {
 // Derive the keypair from a 32-byte seed, encrypt the SEED at rest, and write
 // key.json (0600). The seed is all that's needed to regenerate the key — it is
 // exactly what the 24-word recovery phrase encodes. Returns the sqr1 address.
-fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> String {
+fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, String> {
     let (pk, _sk) = ml_dsa_65::KG::keygen_from_seed(seed);
     let pk_bytes = pk.into_bytes();
     let addr = derive_address(&pk_bytes);
@@ -115,7 +115,17 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> String {
     // up (0600 perms are preserved by the copy) before overwriting. A mistaken
     // `new`/restore is then recoverable. (audit: destructive /api/restore)
     if key_path().exists() {
-        let _ = fs::copy(key_path(), key_path().with_extension("json.bak"));
+        // Back up the existing key to a UNIQUE timestamped file BEFORE overwriting,
+        // and ABORT if the backup fails — never destroy the only copy of a funded
+        // key on a best-effort copy. (audit MED: destructive restore/new)
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let bak = key_path().with_extension(format!("json.{}.bak", ts));
+        if let Err(e) = fs::copy(key_path(), &bak) {
+            return Err(format!("refusing to overwrite existing wallet: backup to {} failed: {}", bak.display(), e));
+        }
     }
 
     let salt = rand_bytes(16);
@@ -157,7 +167,7 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> String {
         .unwrap();
     use std::io::Write as _;
     f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes()).unwrap();
-    addr
+    Ok(addr)
 }
 
 fn cmd_new() {
@@ -167,9 +177,10 @@ fn cmd_new() {
     let mnemonic = bip39::Mnemonic::from_entropy(&entropy).expect("mnemonic");
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&entropy);
-    let addr = save_wallet_from_seed(&seed, &password);
+    let res = save_wallet_from_seed(&seed, &password);
     seed.zeroize();
     entropy.zeroize();
+    let addr = res.expect("failed to save wallet");
 
     println!("New ENCRYPTED Sequora wallet (post-quantum, ML-DSA-65 / FIPS 204)");
     println!();
@@ -187,18 +198,21 @@ fn cmd_new() {
 
 fn cmd_restore() {
     let password = get_password();
-    let phrase = env::var("SQRWALLET_MNEMONIC")
+    let mut phrase = env::var("SQRWALLET_MNEMONIC")
         .expect("set SQRWALLET_MNEMONIC to your 24-word recovery phrase (and SQRWALLET_PASSWORD to a new password)");
     let mnemonic = bip39::Mnemonic::parse(phrase.trim())
         .expect("invalid recovery phrase — check the words and their order");
-    let entropy = mnemonic.to_entropy();
+    let mut entropy = mnemonic.to_entropy();
     if entropy.len() != 32 {
         panic!("expected a 24-word recovery phrase");
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&entropy);
-    let addr = save_wallet_from_seed(&seed, &password);
+    let res = save_wallet_from_seed(&seed, &password);
     seed.zeroize();
+    entropy.zeroize(); // scrub the raw 32-byte master secret
+    phrase.zeroize();  // scrub the recovery phrase string
+    let addr = res.expect("failed to save wallet");
 
     println!("Wallet restored from recovery phrase.");
     println!("  address  : {}", addr);
@@ -274,8 +288,14 @@ fn load_keypair(pw: &str) -> (Vec<u8>, ml_dsa_65::PrivateKey) {
         let mut seed = [0u8; 32];
         seed.copy_from_slice(&seed_vec);
         seed_vec.zeroize();
-        let (_pk, sk) = ml_dsa_65::KG::keygen_from_seed(&seed);
+        let (pk2, sk) = ml_dsa_65::KG::keygen_from_seed(&seed);
         seed.zeroize();
+        // Integrity: pubkey/address live OUTSIDE the AEAD, so verify the decrypted
+        // seed actually derives the stored pubkey; reject a tampered file. (audit LOW)
+        let pk2b = pk2.into_bytes();
+        if &pk2b[..] != &pubkey[..] {
+            panic!("key file integrity check failed: stored pubkey does not match the decrypted seed");
+        }
         sk
     } else {
         // Legacy wallet: the private key itself is encrypted (no recovery phrase).
@@ -619,24 +639,29 @@ fn api_unlock(body: &str) -> (u16, &'static str, String) {
 // writes a fresh key.json encrypted under the supplied (new) password.
 fn api_restore(body: &str) -> (u16, &'static str, String) {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
-    let phrase = v["mnemonic"].as_str().unwrap_or("").trim().to_string();
+    let mut phrase = v["mnemonic"].as_str().unwrap_or("").trim().to_string();
     let pw = v["password"].as_str().unwrap_or("");
     if phrase.is_empty() || pw.is_empty() {
         return (200, "application/json", "{\"ok\":false,\"error\":\"recovery phrase and a new password are both required\"}".into());
     }
-    let mnemonic = match bip39::Mnemonic::parse(phrase) {
+    let mnemonic = match bip39::Mnemonic::parse(&phrase) {
         Ok(m) => m,
         Err(_) => return (200, "application/json", "{\"ok\":false,\"error\":\"invalid recovery phrase — check the words and order\"}".into()),
     };
-    let entropy = mnemonic.to_entropy();
+    let mut entropy = mnemonic.to_entropy();
     if entropy.len() != 32 {
         return (200, "application/json", "{\"ok\":false,\"error\":\"expected a 24-word recovery phrase\"}".into());
     }
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&entropy);
-    let addr = save_wallet_from_seed(&seed, pw);
+    let res = save_wallet_from_seed(&seed, pw);
     seed.zeroize();
-    (200, "application/json", serde_json::json!({"ok": true, "address": addr}).to_string())
+    entropy.zeroize(); // scrub raw master secret
+    phrase.zeroize();  // scrub the supplied recovery phrase
+    match res {
+        Ok(addr) => (200, "application/json", serde_json::json!({"ok": true, "address": addr}).to_string()),
+        Err(e) => (200, "application/json", serde_json::json!({"ok": false, "error": e}).to_string()),
+    }
 }
 
 fn route(method: &tiny_http::Method, url: &str, body: &str, chain_id: &str, rest: &str) -> (u16, &'static str, String) {
@@ -811,7 +836,8 @@ body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opa
 .app{width:100%;max-width:440px}
 .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
 .brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:16px;letter-spacing:1px;text-transform:uppercase}
-.logo{width:28px;height:28px;background:var(--ac);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:800;color:#fff}
+.logo{width:28px;height:28px;display:flex;align-items:center;justify-content:center}
+.logo svg{width:100%;height:100%;display:block}
 .net{font-family:var(--mono);font-size:11px;letter-spacing:.5px;color:var(--mut);background:transparent;border:1px solid var(--line);padding:5px 10px;text-transform:uppercase}
 .hero{background:var(--card);border:1px solid var(--line2);padding:22px;position:relative;overflow:hidden}
 .hero:after{content:"";position:absolute;right:0;top:0;width:3px;height:100%;background:var(--ac)}
@@ -861,7 +887,7 @@ input:focus{border-color:var(--ac)}
 #confirm .acts{display:flex;gap:10px;margin-top:16px}#confirm .acts .btn{flex:1;margin-top:0}
 </style></head><body>
 <div id="lock"><div class="box">
-  <div class="logo">S</div>
+  <div class="logo"><svg viewBox="0 0 32 32" aria-hidden="true"><polygon points="16,3 28,10 16,17 4,10" fill="#8b7dff"/><polygon points="4,10 16,17 16,31 4,24" fill="#4f3fd0"/><polygon points="28,10 16,17 16,31 28,24" fill="#6c5cff"/></svg></div>
   <h1>Sequora</h1>
   <div class="tag">post-quantum wallet · enter your password to unlock</div>
   <div style="position:relative">
@@ -882,7 +908,7 @@ input:focus{border-color:var(--ac)}
   </div>
 </div></div>
 <div class="app hide" id="app">
- <div class="top"><div class="brand"><div class="logo">S</div>Sequora</div><div style="display:flex;gap:8px;align-items:center"><div class="net">● sequora-wasm</div><div class="net lockbtn" onclick="lock()">LOCK</div></div></div>
+ <div class="top"><div class="brand"><div class="logo"><svg viewBox="0 0 32 32" aria-hidden="true"><polygon points="16,3 28,10 16,17 4,10" fill="#8b7dff"/><polygon points="4,10 16,17 16,31 4,24" fill="#4f3fd0"/><polygon points="28,10 16,17 16,31 28,24" fill="#6c5cff"/></svg></div>Sequora</div><div style="display:flex;gap:8px;align-items:center"><div class="net">● sequora-wasm</div><div class="net lockbtn" onclick="lock()">LOCK</div></div></div>
  <div class="hero">
    <div class="lbl">Total balance · post-quantum secured</div>
    <div class="amt"><span id="bal">0</span> <small>SQR</small></div>
@@ -946,7 +972,7 @@ async function unlock(){
     }else{$('lerr').textContent=r.error||'wrong password';$('lpw').select()}
   }catch(e){$('lerr').textContent='could not reach wallet'}
 }
-function lock(){PW='';clearTimeout(idleTimer);$('app').classList.add('hide');$('lock').classList.remove('hide');$('lpw').value='';$('lcount').textContent='';$('lpw').focus()}
+function lock(){PW='';clearTimeout(idleTimer);clearInterval(intv);intv=null;started=false;$('app').classList.add('hide');$('lock').classList.remove('hide');$('lpw').value='';$('lcount').textContent='';$('lpw').focus()}
 function toggleEye(){const i=$('lpw');i.type=i.type==='password'?'text':'password'}
 function showRec(){$('rec').classList.toggle('hide')}
 async function restore(){

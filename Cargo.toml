@@ -22,5 +22,5 @@ chacha20poly1305 = "0.10"
 getrandom = "0.2"
 tiny_http = "0.12"
 zeroize = "1"
-bip39 = "2"
+bip39 = { version = "2", features = ["zeroize"] }
 rpassword = "7"
