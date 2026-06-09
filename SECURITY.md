@@ -22,7 +22,7 @@ Please give us reasonable time to patch and ship before any public disclosure
 
 ## Scope
 
-In scope: the chain (`sequorad`), the wallet, and supporting tooling in these
+In scope: the chain (`seaqoind`), the wallet, and supporting tooling in these
 repositories. Out of scope: third-party dependencies (report upstream), and
 social-engineering or physical attacks.
 
