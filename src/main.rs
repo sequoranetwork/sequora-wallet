@@ -44,8 +44,13 @@ fn key_path() -> PathBuf {
 // --- key-at-rest encryption (Argon2id KDF + ChaCha20-Poly1305 AEAD) ---
 
 fn get_password() -> String {
-    env::var("SQRWALLET_PASSWORD")
-        .expect("set SQRWALLET_PASSWORD to unlock the wallet (a real wallet would prompt securely / use the OS keychain)")
+    // Prefer the env var for scripted/CI use; otherwise prompt with no echo so the
+    // password isn't exposed in process env / shell history. (threat-model: env-var
+    // password leak). A production build would also support the OS keychain.
+    match env::var("SQRWALLET_PASSWORD") {
+        Ok(p) => p,
+        Err(_) => rpassword::prompt_password("Wallet password: ").expect("failed to read password"),
+    }
 }
 
 fn rand_bytes(n: usize) -> Vec<u8> {
