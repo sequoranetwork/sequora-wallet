@@ -1,6 +1,6 @@
-# Contributing to Seaqoin
+# Contributing to Sequora
 
-Thanks for your interest! Seaqoin is an open, community-oriented project — a
+Thanks for your interest! Sequora is an open, community-oriented project — a
 quantum-resistant Layer 1 (chain), a secure wallet, and a website. Contributions
 of all kinds are welcome.
 
@@ -21,7 +21,7 @@ of all kinds are welcome.
 
 ## Build & test
 
-- **Chain** (Go): `make install` to build `seaqoind`; `make test` (govet +
+- **Chain** (Go): `make install` to build `sequorad`; `make test` (govet +
   govulncheck + unit tests). New logic should come with tests.
 - **Wallet** (Rust): `cargo build --release`; `cargo test`; `cargo audit`.
 - **Website**: static — open `index.html`, or `python3 -m http.server`.

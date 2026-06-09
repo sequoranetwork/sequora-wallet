@@ -1,4 +1,4 @@
-// Seaqoin wallet — Rust shared-core prototype.
+// Sequora wallet — Rust shared-core prototype.
 // Generates a post-quantum ML-DSA-65 key, derives the chain's sqr1... address
 // (SHA-256(pubkey)[:20] + bech32 "sqr" — identical to the Go chain), and queries
 // a balance from the chain's REST API.
@@ -38,7 +38,7 @@ const DENOM: &str = "usqr";
 
 fn key_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".seaqoin-wallet").join("key.json")
+    PathBuf::from(home).join(".sequora-wallet").join("key.json")
 }
 
 // --- key-at-rest encryption (Argon2id KDF + ChaCha20-Poly1305 AEAD) ---
@@ -130,7 +130,7 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> String {
     seed_vec.zeroize(); // scrub the plaintext seed buffer
 
     let dir = key_path().parent().unwrap().to_path_buf();
-    // dir 0700: only the owner may traverse ~/.seaqoin-wallet
+    // dir 0700: only the owner may traverse ~/.sequora-wallet
     fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
     let json = serde_json::json!({
         "scheme": "ML-DSA-65",
@@ -171,7 +171,7 @@ fn cmd_new() {
     seed.zeroize();
     entropy.zeroize();
 
-    println!("New ENCRYPTED Seaqoin wallet (post-quantum, ML-DSA-65 / FIPS 204)");
+    println!("New ENCRYPTED Sequora wallet (post-quantum, ML-DSA-65 / FIPS 204)");
     println!();
     println!("  ┌─ RECOVERY PHRASE (24 words) — WRITE THIS DOWN ON PAPER ─────────");
     println!("  │  {}", mnemonic);
@@ -706,7 +706,7 @@ fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
     let server = std::sync::Arc::new(tiny_http::Server::http(&bind).expect("bind"));
 
     // CSRF/auth defense (SECURITY finding C1): a token is embedded into the served
-    // page and required on EVERY /api/* request via the X-Seaqoin-Token header. A
+    // page and required on EVERY /api/* request via the X-Sequora-Token header. A
     // malicious site the user visits cannot read this page (same-origin policy) so
     // it cannot learn the token, and the custom header forces a CORS preflight that
     // a cross-origin caller fails. Without this, any website could POST a signed
@@ -719,7 +719,7 @@ fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
     let chain_id = chain_id.to_string();
     let rest = rest.to_string();
 
-    println!("Seaqoin wallet UI running:");
+    println!("Sequora wallet UI running:");
     println!("  open  http://localhost:{port}  in your browser");
     println!("  chain {chain_id} via {rest}");
 
@@ -761,7 +761,7 @@ fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[S
     let url = req.url().to_string();
     let is_api = url.starts_with("/api/");
     if is_api {
-        let tok_ok = header_value(&req, "X-Seaqoin-Token").map(|t| ct_eq(&t, token)).unwrap_or(false);
+        let tok_ok = header_value(&req, "X-Sequora-Token").map(|t| ct_eq(&t, token)).unwrap_or(false);
         let origin_ok = match header_value(&req, "Origin") {
             Some(o) => allowed_origins.iter().any(|a| ct_eq(a, &o)),
             None => true, // same-origin GETs/POSTs may omit Origin
@@ -801,69 +801,72 @@ fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[S
 }
 
 const DASHBOARD_HTML: &str = r##"<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>Seaqoin Wallet</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sequora Wallet</title>
 <style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Inter',system-ui,sans-serif;min-height:100vh;color:#eceaf5;display:flex;justify-content:center;padding:28px 14px;
- background:radial-gradient(1200px 600px at 50% -10%,#2a1f4d 0%,#14111f 55%,#0b0a12 100%)}
+*{box-sizing:border-box;margin:0;padding:0;border-radius:0}
+:root{--ac:#6c5cff;--bg:#0a0a0e;--ink:#f2f2f6;--mut:#9696a6;--faint:#5e5e72;--card:#0f0f15;--line:rgba(255,255,255,.12);--line2:rgba(255,255,255,.22);--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+body{font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;min-height:100vh;color:var(--ink);display:flex;justify-content:center;padding:28px 14px;background:var(--bg)}
+body::before{content:"";position:fixed;inset:0;z-index:-2;background:radial-gradient(800px 420px at 50% -60px,rgba(108,92,255,.13),transparent 70%),var(--bg)}
+body::after{content:"";position:fixed;inset:0;z-index:-1;pointer-events:none;opacity:.5;background-image:linear-gradient(rgba(255,255,255,.028) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.028) 1px,transparent 1px);background-size:44px 44px}
 .app{width:100%;max-width:440px}
 .top{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:17px}
-.logo{width:30px;height:30px;border-radius:9px;background:linear-gradient(135deg,#8a5cff,#5b8dff);display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 4px 14px rgba(138,92,255,.45)}
-.net{font-size:11px;color:#a8a4c4;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.08);padding:4px 10px;border-radius:20px}
-.hero{background:linear-gradient(135deg,#7b5cff 0%,#5b8dff 100%);border-radius:22px;padding:22px;box-shadow:0 16px 40px rgba(91,141,255,.30);position:relative;overflow:hidden}
-.hero:after{content:"";position:absolute;right:-40px;top:-40px;width:160px;height:160px;border-radius:50%;background:rgba(255,255,255,.12)}
-.hero .lbl{font-size:12px;color:rgba(255,255,255,.85);font-weight:500}
-.hero .amt{font-size:38px;font-weight:800;letter-spacing:-1px;margin:4px 0 2px}
-.hero .amt small{font-size:18px;font-weight:600;opacity:.85}
-.hero .addr{font-size:11px;font-family:ui-monospace,monospace;color:rgba(255,255,255,.9);background:rgba(0,0,0,.18);padding:6px 10px;border-radius:10px;margin-top:12px;display:inline-flex;gap:8px;align-items:center;cursor:pointer}
-.tabs{display:flex;gap:6px;background:rgba(255,255,255,.05);border-radius:14px;padding:5px;margin:18px 0}
-.tab{flex:1;text-align:center;padding:9px;border-radius:10px;font-weight:600;font-size:14px;color:#a8a4c4;cursor:pointer}
-.tab.on{background:linear-gradient(135deg,#8a5cff,#5b8dff);color:#fff;box-shadow:0 4px 12px rgba(138,92,255,.4)}
-.card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:16px;margin-bottom:12px}
-.card h3{font-size:12px;color:#bdb8da;font-weight:600;margin-bottom:10px;text-transform:uppercase;letter-spacing:.6px}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:16px;letter-spacing:1px;text-transform:uppercase}
+.logo{width:28px;height:28px;background:var(--ac);display:flex;align-items:center;justify-content:center;font-size:15px;font-weight:800;color:#fff}
+.net{font-family:var(--mono);font-size:11px;letter-spacing:.5px;color:var(--mut);background:transparent;border:1px solid var(--line);padding:5px 10px;text-transform:uppercase}
+.hero{background:var(--card);border:1px solid var(--line2);padding:22px;position:relative;overflow:hidden}
+.hero:after{content:"";position:absolute;right:0;top:0;width:3px;height:100%;background:var(--ac)}
+.hero .lbl{font-family:var(--mono);font-size:11px;letter-spacing:.5px;text-transform:uppercase;color:var(--mut)}
+.hero .amt{font-size:38px;font-weight:800;letter-spacing:-1px;margin:6px 0 2px}
+.hero .amt small{font-size:18px;font-weight:600;color:var(--mut)}
+.hero .addr{font-size:11px;font-family:var(--mono);color:var(--ink);background:#0c0c12;border:1px solid var(--line);padding:7px 10px;margin-top:12px;display:inline-flex;gap:8px;align-items:center;cursor:pointer}
+.tabs{display:flex;gap:0;border:1px solid var(--line);margin:18px 0}
+.tab{flex:1;text-align:center;padding:11px;font-weight:700;font-size:13px;letter-spacing:.5px;text-transform:uppercase;color:var(--mut);cursor:pointer;border-right:1px solid var(--line)}
+.tab:last-child{border-right:0}
+.tab.on{background:var(--ac);color:#fff}
+.card{background:var(--card);border:1px solid var(--line);padding:16px;margin-bottom:12px}
+.card h3{font-family:var(--mono);font-size:11px;color:var(--mut);font-weight:700;margin-bottom:10px;text-transform:uppercase;letter-spacing:.6px}
 .asset{display:flex;align-items:center;gap:12px}
-.coin{width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#8a5cff,#5b8dff);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;color:#fff}
-.asset .nm{font-weight:600}.asset .sub{font-size:12px;color:#9a96b8}.asset .val{margin-left:auto;text-align:right;font-weight:700}
-label{font-size:12px;color:#9a96b8;display:block;margin:10px 0 4px}
-input{width:100%;background:rgba(0,0,0,.25);color:#eceaf5;border:1px solid rgba(255,255,255,.1);border-radius:11px;padding:11px 12px;font-size:14px;font-family:inherit;outline:none}
-input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
-.btn{width:100%;background:linear-gradient(135deg,#8a5cff,#5b8dff);color:#fff;border:0;border-radius:12px;padding:12px;font-size:14px;font-weight:700;cursor:pointer;margin-top:12px;transition:transform .08s,box-shadow .2s;box-shadow:0 6px 18px rgba(123,92,255,.35)}
-.btn:hover{transform:translateY(-1px);box-shadow:0 10px 24px rgba(123,92,255,.5)}
-.btn.sm{width:auto;padding:8px 14px;margin:0;font-size:13px}.btn.alt{background:rgba(255,255,255,.09);box-shadow:none}
-.vrow{display:flex;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid rgba(255,255,255,.06)}.vrow:last-child{border:0}
-.vrow .vn{font-weight:600;font-size:14px}.vrow .vs{font-size:11px;color:#9a96b8}
-.unlock{display:flex;gap:8px;align-items:center;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:6px 12px;margin-bottom:12px}
-.unlock input{border:0;background:transparent;padding:7px;box-shadow:none}
-.foot{text-align:center;font-size:11px;color:#6f6b8c;margin-top:18px}.hide{display:none!important}
-#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(90px);background:#1c1830;border:1px solid rgba(255,255,255,.12);border-radius:14px;padding:13px 18px;max-width:400px;box-shadow:0 12px 40px rgba(0,0,0,.5);transition:transform .35s;z-index:9}
+.coin{width:40px;height:40px;background:var(--ac);display:flex;align-items:center;justify-content:center;font-weight:800;font-size:12px;color:#fff}
+.asset .nm{font-weight:700}.asset .sub{font-size:12px;color:var(--mut)}.asset .val{margin-left:auto;text-align:right;font-weight:800}
+label{font-family:var(--mono);font-size:11px;letter-spacing:.4px;text-transform:uppercase;color:var(--mut);display:block;margin:12px 0 5px}
+input{width:100%;background:#0c0c12;color:var(--ink);border:1px solid var(--line);padding:11px 12px;font-size:14px;font-family:inherit;outline:none}
+input:focus{border-color:var(--ac)}
+.btn{width:100%;background:var(--ac);color:#fff;border:1px solid var(--ac);padding:13px;font-size:13px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;cursor:pointer;margin-top:14px;transition:background .15s}
+.btn:hover{background:#5a48f0}
+.btn.sm{width:auto;padding:9px 16px;margin:0}.btn.alt{background:transparent;color:var(--ink);border-color:var(--line2)}
+.btn.alt:hover{border-color:var(--ac)}
+.vrow{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:1px solid var(--line)}.vrow:last-child{border:0}
+.vrow .vn{font-weight:700;font-size:14px}.vrow .vs{font-size:11px;color:var(--mut);font-family:var(--mono)}
+.unlock{display:flex;gap:8px;align-items:center;background:var(--card);border:1px solid var(--line);padding:6px 12px;margin-bottom:12px}
+.unlock input{border:0;background:transparent;padding:7px}
+.foot{text-align:center;font-family:var(--mono);font-size:10px;letter-spacing:.4px;text-transform:uppercase;color:var(--faint);margin-top:18px}.hide{display:none!important}
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%) translateY(90px);background:#14141c;border:1px solid var(--line2);padding:13px 18px;max-width:400px;transition:transform .35s;z-index:9}
 #toast.show{transform:translateX(-50%) translateY(0)}
-#toast.ok{border-color:rgba(80,220,140,.55)}#toast.err{border-color:rgba(255,90,90,.55)}
-#toast .h{font-weight:700;margin-bottom:3px;font-size:13px}#toast .m{color:#a8a4c4;font-family:ui-monospace,monospace;font-size:11px;word-break:break-all}
-#lock{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:20;
- background:radial-gradient(1200px 600px at 50% -10%,#2a1f4d 0%,#14111f 55%,#0b0a12 100%)}
-#lock .box{width:100%;max-width:360px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:20px;padding:32px 26px;text-align:center;box-shadow:0 16px 50px rgba(0,0,0,.45)}
-#lock .logo{width:56px;height:56px;border-radius:16px;margin:0 auto 16px;font-size:28px}
-#lock h1{font-size:21px;font-weight:800;letter-spacing:-.5px}
-#lock .tag{font-size:12px;color:#9a96b8;margin:4px 0 22px}
+#toast.ok{border-color:var(--ac)}#toast.err{border-color:#ff5a5a}
+#toast .h{font-weight:700;margin-bottom:3px;font-size:13px}#toast .m{color:var(--mut);font-family:var(--mono);font-size:11px;word-break:break-all}
+#lock{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:20;background:var(--bg)}
+#lock .box{width:100%;max-width:360px;background:var(--card);border:1px solid var(--line2);padding:34px 26px;text-align:center}
+#lock .logo{width:52px;height:52px;margin:0 auto 16px;font-size:26px}
+#lock h1{font-size:20px;font-weight:800;letter-spacing:1px;text-transform:uppercase}
+#lock .tag{font-family:var(--mono);font-size:11px;color:var(--mut);margin:6px 0 22px;letter-spacing:.3px}
 #lock input{text-align:center;font-size:15px;padding:13px}
 #lock .err{color:#ff7a7a;font-size:12px;min-height:16px;margin-top:12px}
 .lockbtn{cursor:pointer;user-select:none}
-#confirm{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:25;background:rgba(8,6,16,.72)}
-#confirm .box{width:100%;max-width:360px;background:#1a1730;border:1px solid rgba(255,255,255,.1);border-radius:18px;padding:22px;box-shadow:0 18px 50px rgba(0,0,0,.5)}
-#confirm h3{font-size:16px;font-weight:800;margin-bottom:6px}
-#confirm .cfsub{font-size:12px;color:#9a96b8;margin-bottom:12px}
-.cfrow{display:flex;justify-content:space-between;gap:12px;padding:9px 0;border-bottom:1px solid rgba(255,255,255,.06);font-size:13px}
-.cfrow:last-child{border:0}.cfrow span{color:#9a96b8;white-space:nowrap}.cfrow b{text-align:right;word-break:break-all;font-family:ui-monospace,monospace}
+#confirm{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;z-index:25;background:rgba(8,6,16,.82)}
+#confirm .box{width:100%;max-width:360px;background:var(--card);border:1px solid var(--line2);padding:24px}
+#confirm h3{font-size:16px;font-weight:800;margin-bottom:6px;letter-spacing:.3px}
+#confirm .cfsub{font-size:12px;color:var(--mut);margin-bottom:12px}
+.cfrow{display:flex;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--line);font-size:13px}
+.cfrow:last-child{border:0}.cfrow span{color:var(--mut);white-space:nowrap;font-family:var(--mono);font-size:11px;text-transform:uppercase}.cfrow b{text-align:right;word-break:break-all;font-family:var(--mono)}
 #confirm .acts{display:flex;gap:10px;margin-top:16px}#confirm .acts .btn{flex:1;margin-top:0}
 </style></head><body>
 <div id="lock"><div class="box">
-  <div class="logo">🛡️</div>
-  <h1>Seaqoin</h1>
+  <div class="logo">S</div>
+  <h1>Sequora</h1>
   <div class="tag">post-quantum wallet · enter your password to unlock</div>
   <div style="position:relative">
     <input id="lpw" type="password" placeholder="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" onkeydown="if(event.key==='Enter')unlock()">
-    <span id="eye" onclick="toggleEye()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;user-select:none;font-size:15px;opacity:.65" title="show / hide">👁</span>
+    <span id="eye" onclick="toggleEye()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;user-select:none;font-size:15px;opacity:.65" title="show / hide">show</span>
   </div>
   <div id="lcount" style="font-size:11px;color:#6f6b8c;margin-top:6px;min-height:14px"></div>
   <button class="btn" onclick="unlock()">Unlock</button>
@@ -879,7 +882,7 @@ input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
   </div>
 </div></div>
 <div class="app hide" id="app">
- <div class="top"><div class="brand"><div class="logo">🛡️</div>Seaqoin</div><div style="display:flex;gap:8px;align-items:center"><div class="net">● seaqoin-wasm</div><div class="net lockbtn" onclick="lock()">🔒 Lock</div></div></div>
+ <div class="top"><div class="brand"><div class="logo">S</div>Sequora</div><div style="display:flex;gap:8px;align-items:center"><div class="net">● sequora-wasm</div><div class="net lockbtn" onclick="lock()">LOCK</div></div></div>
  <div class="hero">
    <div class="lbl">Total balance · post-quantum secured</div>
    <div class="amt"><span id="bal">0</span> <small>SQR</small></div>
@@ -887,14 +890,14 @@ input:focus{border-color:#7b5cff;box-shadow:0 0 0 3px rgba(123,92,255,.2)}
  </div>
  <div class="tabs"><div class="tab on" id="tw" onclick="tab('w')">Wallet</div><div class="tab" id="ts" onclick="tab('s')">Stake</div><div class="tab" id="tv" onclick="tab('v')">Validator</div></div>
  <div id="vw">
-   <div class="card"><div class="asset"><div class="coin">SQR</div><div><div class="nm">Seaqoin</div><div class="sub">ML-DSA-65 · quantum-safe</div></div><div class="val"><span id="bal2">0</span><div class="sub">SQR</div></div></div></div>
+   <div class="card"><div class="asset"><div class="coin">SQR</div><div><div class="nm">Sequora</div><div class="sub">ML-DSA-65 · quantum-safe</div></div><div class="val"><span id="bal2">0</span><div class="sub">SQR</div></div></div></div>
    <div class="card"><h3>Send</h3>
      <label>Recipient address</label><input id="sendTo" placeholder="sqr1…">
      <label>Amount (SQR)</label><input id="sendAmt" placeholder="0.00" inputmode="decimal">
      <button class="btn" onclick="send()">Send SQR</button></div>
  </div>
  <div id="vs2" class="hide">
-   <div class="card"><h3>Staking rewards</h3><div class="asset"><div class="coin" style="background:linear-gradient(135deg,#3ddc97,#2bb673)">★</div><div><div class="nm"><span id="rew">0</span> SQR</div><div class="sub">pending across delegations</div></div></div></div>
+   <div class="card"><h3>Staking rewards</h3><div class="asset"><div class="coin">+</div><div><div class="nm"><span id="rew">0</span> SQR</div><div class="sub">pending across delegations</div></div></div></div>
    <div class="card"><h3>Your delegations</h3><div id="dels"></div></div>
    <div class="card"><h3>Validators</h3><div id="vals"></div></div>
  </div>
@@ -934,7 +937,7 @@ async function unlock(){
   if(!p){$('lerr').textContent='enter your password';return}
   $('lerr').textContent='unlocking…';
   try{
-    const resp=await fetch('/api/unlock',{method:'POST',headers:{'X-Seaqoin-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({password:p})});
+    const resp=await fetch('/api/unlock',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({password:p})});
     const r=await resp.json();
     if(r.ok){PW=p;$('lpw').value='';$('lerr').textContent='';
       $('lock').classList.add('hide');$('app').classList.remove('hide');
@@ -953,7 +956,7 @@ async function restore(){
   if(!$('rack').checked){$('lerr').textContent='please tick the confirmation box';return}
   $('lerr').textContent='restoring…';
   try{
-    const r=await (await fetch('/api/restore',{method:'POST',headers:{'X-Seaqoin-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({mnemonic:ph,password:rp})})).json();
+    const r=await (await fetch('/api/restore',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({mnemonic:ph,password:rp})})).json();
     if(r.ok){PW=rp;$('rphrase').value='';$('rpw').value='';$('rack').checked=false;$('lerr').textContent='';
       $('lock').classList.add('hide');$('app').classList.remove('hide');
       if(!started){started=true;refresh();intv=setInterval(refresh,15000)}else{refresh()}
@@ -967,7 +970,7 @@ function tab(t){$('vw').classList.toggle('hide',t!='w');$('vs2').classList.toggl
 function copyAddr(){navigator.clipboard.writeText(ADDR);toast('ok','Address copied',ADDR)}
 function toast(k,h,m){let t=$('toast');t.className='show '+k;$('th').textContent=h;$('tm').textContent=m||'';setTimeout(()=>t.className=t.className.replace('show',''),4500)}
 async function refresh(){
-  let resp=await fetch('/api/info',{headers:{'X-Seaqoin-Token':TOKEN}});
+  let resp=await fetch('/api/info',{headers:{'X-Sequora-Token':TOKEN}});
   if(!resp.ok){ // stale token / forbidden — stop hammering and reload a fresh page
     if(intv){clearInterval(intv);intv=null}
     toast('err','Session expired','reloading…');setTimeout(()=>location.reload(),900);return;
@@ -995,7 +998,7 @@ async function refresh(){
 async function post(path,obj,label){
   if(!PW){lock();return}
   obj.password=PW;
-  let d=await (await fetch(path,{method:'POST',headers:{'X-Seaqoin-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(obj)})).json();
+  let d=await (await fetch(path,{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify(obj)})).json();
   if(d.error||(d.code&&d.code!=0))toast('err',label+' failed',d.error||d.log||('code '+d.code));
   else toast('ok',label+' sent ✓','tx '+(d.txhash||'').slice(0,28)+'…');
   setTimeout(refresh,3500);
@@ -1034,42 +1037,42 @@ fn main() {
         "restore" => cmd_restore(),
         "address" => cmd_address(),
         "balance" => cmd_balance(args.get(2).map(String::as_str).unwrap_or("http://localhost:1317")),
-        "sign" => cmd_sign(args.get(2).map(String::as_str).unwrap_or("hello-seaqoin")),
+        "sign" => cmd_sign(args.get(2).map(String::as_str).unwrap_or("hello-sequora")),
         "serve" => {
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8088);
-            let chain_id = args.get(3).map(String::as_str).unwrap_or("seaqoin-wasm");
+            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-wasm");
             let rest = args.get(4).map(String::as_str).unwrap_or("http://localhost:1317");
             cmd_serve(port, chain_id, rest);
         }
         "stake" => {
             let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet stake <valoper> <amount> [chain_id] [rest_url]");
             let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet stake <valoper> <amount> [chain_id] [rest_url]");
-            let chain_id = args.get(4).map(String::as_str).unwrap_or("seaqoin-wasm");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
             let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
             cmd_stake(rest, chain_id, valoper, amount);
         }
         "send" => {
             let to = args.get(2).map(String::as_str).expect("usage: sqrwallet send <to_addr> <amount> [chain_id] [rest_url]");
             let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet send <to_addr> <amount> [chain_id] [rest_url]");
-            let chain_id = args.get(4).map(String::as_str).unwrap_or("seaqoin-wasm");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
             let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
             cmd_send(rest, chain_id, to, amount);
         }
         "claim" => {
             let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet claim <valoper> [chain_id] [rest_url]");
-            let chain_id = args.get(3).map(String::as_str).unwrap_or("seaqoin-wasm");
+            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-wasm");
             let rest = args.get(4).map(String::as_str).unwrap_or("http://localhost:1317");
             cmd_claim(rest, chain_id, valoper);
         }
         "unstake" => {
             let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet unstake <valoper> <amount> [chain_id] [rest_url]");
             let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet unstake <valoper> <amount> [chain_id] [rest_url]");
-            let chain_id = args.get(4).map(String::as_str).unwrap_or("seaqoin-wasm");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
             let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
             cmd_unstake(rest, chain_id, valoper, amount);
         }
         _ => {
-            println!("Seaqoin wallet (Rust shared-core prototype)");
+            println!("Sequora wallet (Rust shared-core prototype)");
             println!("  sqrwallet new                 generate a wallet + 24-word recovery phrase");
             println!("  sqrwallet restore             recover a wallet (SQRWALLET_MNEMONIC + SQRWALLET_PASSWORD)");
             println!("  sqrwallet address             print this wallet's address");
