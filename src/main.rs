@@ -664,11 +664,43 @@ fn api_restore(body: &str) -> (u16, &'static str, String) {
     }
 }
 
+// Create a brand-new wallet: generate fresh 32-byte entropy -> 24-word phrase ->
+// ML-DSA keys, write an encrypted key.json under the supplied password, and return
+// the address + the phrase ONCE so the user can write it down. (web "create wallet")
+fn api_new(body: &str) -> (u16, &'static str, String) {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    let pw = v["password"].as_str().unwrap_or("");
+    if pw.is_empty() {
+        return (200, "application/json", "{\"ok\":false,\"error\":\"a password is required\"}".into());
+    }
+    let mut entropy = rand_bytes(32);
+    let mnemonic = match bip39::Mnemonic::from_entropy(&entropy) {
+        Ok(m) => m,
+        Err(_) => {
+            entropy.zeroize();
+            return (200, "application/json", "{\"ok\":false,\"error\":\"key generation failed\"}".into());
+        }
+    };
+    let phrase = mnemonic.to_string();
+    let mut seed = [0u8; 32];
+    seed.copy_from_slice(&entropy);
+    let res = save_wallet_from_seed(&seed, pw);
+    seed.zeroize();
+    entropy.zeroize();
+    match res {
+        // phrase is intentionally returned (shown once for the user to record offline);
+        // the mnemonic object is zeroized on drop (bip39 zeroize feature).
+        Ok(addr) => (200, "application/json", serde_json::json!({"ok": true, "address": addr, "mnemonic": phrase}).to_string()),
+        Err(e) => (200, "application/json", serde_json::json!({"ok": false, "error": e}).to_string()),
+    }
+}
+
 fn route(method: &tiny_http::Method, url: &str, body: &str, chain_id: &str, rest: &str) -> (u16, &'static str, String) {
     match (method, url) {
         (tiny_http::Method::Get, "/") => (200, "text/html", DASHBOARD_HTML.to_string()),
         (tiny_http::Method::Get, "/api/info") => (200, "application/json", info_json(rest)),
         (tiny_http::Method::Post, "/api/unlock") => api_unlock(body),
+        (tiny_http::Method::Post, "/api/new") => api_new(body),
         (tiny_http::Method::Post, "/api/restore") => api_restore(body),
         (tiny_http::Method::Post, "/api/send") => api_action(body, rest, chain_id, "send"),
         (tiny_http::Method::Post, "/api/stake") => api_action(body, rest, chain_id, "stake"),
@@ -904,6 +936,22 @@ input:focus{border-color:var(--ac)}
     <label style="font-size:11px;color:#9a96b8;display:flex;gap:7px;margin-top:10px;align-items:flex-start"><input type="checkbox" id="rack" style="width:auto;margin-top:2px"><span>I understand this replaces any wallet currently stored on this device.</span></label>
     <button class="btn" onclick="restore()">Restore wallet</button>
   </div>
+  <div id="newlink" onclick="showNew()" style="font-size:12px;color:#8a8fb8;margin-top:10px;cursor:pointer">+ Create a new wallet</div>
+  <div id="newbox" class="hide" style="margin-top:14px;text-align:left">
+    <label style="font-size:12px;color:#9a96b8;display:block;margin-bottom:4px">New password for this device</label>
+    <input id="npw" type="password" placeholder="set a password" autocomplete="off">
+    <label style="font-size:12px;color:#9a96b8;display:block;margin:10px 0 4px">Confirm password</label>
+    <input id="npw2" type="password" placeholder="repeat password" autocomplete="off">
+    <label style="font-size:11px;color:#9a96b8;display:flex;gap:7px;margin-top:10px;align-items:flex-start"><input type="checkbox" id="nack" style="width:auto;margin-top:2px"><span>I understand this replaces any wallet on this device, and I will write down the recovery phrase.</span></label>
+    <button class="btn" id="newbtn" onclick="createWallet()">Create wallet</button>
+    <div id="newresult" class="hide" style="margin-top:14px">
+      <div style="font-size:11px;color:#ffb070;line-height:1.5">&#9888; WRITE THESE 24 WORDS DOWN — on paper, offline. They are the ONLY way to recover this wallet. Never share them; never store them online.</div>
+      <div id="newphrase" style="margin-top:8px;background:#0c0c12;border:1px solid var(--line2);padding:11px;font-family:var(--mono);font-size:13px;line-height:1.7;word-spacing:3px"></div>
+      <div id="newaddr" style="margin-top:8px;font-family:var(--mono);font-size:11px;color:var(--mut);word-break:break-all"></div>
+      <label style="font-size:11px;color:#9a96b8;display:flex;gap:7px;margin-top:10px;align-items:flex-start"><input type="checkbox" id="savedack" style="width:auto;margin-top:2px"><span>I have written down my 24 words and stored them safely.</span></label>
+      <button class="btn" onclick="newContinue()">Continue to wallet</button>
+    </div>
+  </div>
 </div></div>
 <div class="app hide" id="app">
  <div class="top"><div class="brand"><div class="logo"></div>Sequora</div><div style="display:flex;gap:8px;align-items:center"><div class="net">● sequora-wasm</div><div class="net lockbtn" onclick="lock()">LOCK</div></div></div>
@@ -987,6 +1035,30 @@ async function restore(){
       resetIdle();toast('ok','Wallet restored ✓',r.address||'');
     }else{$('lerr').textContent=r.error||'restore failed'}
   }catch(e){$('lerr').textContent='could not reach wallet'}
+}
+function showNew(){$('newbox').classList.toggle('hide');$('rec').classList.add('hide')}
+async function createWallet(){
+  const p=$('npw').value, p2=$('npw2').value;
+  if(!p){$('lerr').textContent='set a password';return}
+  if(p!==p2){$('lerr').textContent='passwords do not match';return}
+  if(!$('nack').checked){$('lerr').textContent='please tick the confirmation box';return}
+  $('lerr').textContent='creating…';
+  try{
+    const r=await (await fetch('/api/new',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({password:p})})).json();
+    if(r.ok){PW=p;$('npw').value='';$('npw2').value='';$('lerr').textContent='';
+      $('newphrase').textContent=r.mnemonic||'';      // textContent (not innerHTML) — no injection
+      $('newaddr').textContent=r.address||'';
+      $('newbtn').classList.add('hide');$('newresult').classList.remove('hide');
+    }else{$('lerr').textContent=r.error||'could not create wallet'}
+  }catch(e){$('lerr').textContent='could not reach wallet'}
+}
+function newContinue(){
+  if(!$('savedack').checked){$('lerr').textContent='please confirm you saved your 24 words';return}
+  $('newphrase').textContent='';$('savedack').checked=false;$('nack').checked=false;   // wipe phrase from the DOM
+  $('newbox').classList.add('hide');$('newresult').classList.add('hide');$('newbtn').classList.remove('hide');
+  $('lock').classList.add('hide');$('app').classList.remove('hide');
+  if(!started){started=true;refresh();intv=setInterval(refresh,15000)}else{refresh()}
+  resetIdle();toast('ok','Wallet created',ADDR||'');
 }
 ['click','keydown','touchstart'].forEach(e=>document.addEventListener(e,resetIdle));
 document.addEventListener('DOMContentLoaded',()=>{const i=$('lpw');if(i)i.addEventListener('input',()=>{const n=i.value.length;$('lcount').textContent=n?(n+' character'+(n==1?'':'s')):''})});
