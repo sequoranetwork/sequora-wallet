@@ -944,6 +944,7 @@ input:focus{border-color:var(--ac)}
     <input id="npw2" type="password" placeholder="repeat password" autocomplete="off">
     <label style="font-size:11px;color:#9a96b8;display:flex;gap:7px;margin-top:10px;align-items:flex-start"><input type="checkbox" id="nack" style="width:auto;margin-top:2px"><span>I understand this replaces any wallet on this device, and I will write down the recovery phrase.</span></label>
     <button class="btn" id="newbtn" onclick="createWallet()">Create wallet</button>
+    <div class="err" id="newerr" style="min-height:16px;margin-top:8px"></div>
     <div id="newresult" class="hide" style="margin-top:14px">
       <div style="font-size:11px;color:#ffb070;line-height:1.5">&#9888; WRITE THESE 24 WORDS DOWN — on paper, offline. They are the ONLY way to recover this wallet. Never share them; never store them online.</div>
       <div id="newphrase" style="margin-top:8px;background:#0c0c12;border:1px solid var(--line2);padding:11px;font-family:var(--mono);font-size:13px;line-height:1.7;word-spacing:3px"></div>
@@ -1039,22 +1040,22 @@ async function restore(){
 function showNew(){$('newbox').classList.toggle('hide');$('rec').classList.add('hide')}
 async function createWallet(){
   const p=$('npw').value, p2=$('npw2').value;
-  if(!p){$('lerr').textContent='set a password';return}
-  if(p!==p2){$('lerr').textContent='passwords do not match';return}
-  if(!$('nack').checked){$('lerr').textContent='please tick the confirmation box';return}
-  $('lerr').textContent='creating…';
+  if(!p){$('newerr').textContent='set a password';return}
+  if(p!==p2){$('newerr').textContent='passwords do not match';return}
+  if(!$('nack').checked){$('newerr').textContent='please tick the confirmation box';return}
+  $('newerr').textContent='creating…';
   try{
     const r=await (await fetch('/api/new',{method:'POST',headers:{'X-Sequora-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({password:p})})).json();
-    if(r.ok){PW=p;$('npw').value='';$('npw2').value='';$('lerr').textContent='';
+    if(r.ok){PW=p;$('npw').value='';$('npw2').value='';$('newerr').textContent='';
       $('newphrase').textContent=r.mnemonic||'';      // textContent (not innerHTML) — no injection
       $('newaddr').textContent=r.address||'';
       $('newbtn').classList.add('hide');$('newresult').classList.remove('hide');
-    }else{$('lerr').textContent=r.error||'could not create wallet'}
-  }catch(e){$('lerr').textContent='could not reach wallet'}
+    }else{$('newerr').textContent=r.error||'could not create wallet'}
+  }catch(e){$('newerr').textContent='could not reach wallet'}
 }
 function newContinue(){
-  if(!$('savedack').checked){$('lerr').textContent='please confirm you saved your 24 words';return}
-  $('newphrase').textContent='';$('savedack').checked=false;$('nack').checked=false;   // wipe phrase from the DOM
+  if(!$('savedack').checked){$('newerr').textContent='please tick "I have written down my 24 words" first';return}
+  $('newphrase').textContent='';$('savedack').checked=false;$('nack').checked=false;$('newerr').textContent='';   // wipe phrase from the DOM
   $('newbox').classList.add('hide');$('newresult').classList.add('hide');$('newbtn').classList.remove('hide');
   $('lock').classList.add('hide');$('app').classList.remove('hide');
   if(!started){started=true;refresh();intv=setInterval(refresh,15000)}else{refresh()}
