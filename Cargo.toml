@@ -8,7 +8,13 @@ name = "sqrwallet"
 path = "src/main.rs"
 
 [dependencies]
-fips204 = "0.4"
+# Crypto/seed-handling crates are PINNED to exact versions: a `cargo update` must
+# not silently pull an unvetted patch into the signing binary. Bump only via a
+# reviewed change. (audit LOW: floating caret ranges on security-critical crates)
+fips204 = "=0.4.6"
+argon2 = "=0.5.3"
+chacha20poly1305 = "=0.10.1"
+bip39 = { version = "=2.2.2", features = ["zeroize"] }
 sha2 = "0.10"
 bech32 = "0.9"
 ureq = { version = "2", features = ["json"] }
@@ -17,10 +23,7 @@ hex = "0.4"
 cosmos-sdk-proto = "0.26"
 prost = "0.13"
 base64 = "0.22"
-argon2 = "0.5"
-chacha20poly1305 = "0.10"
 getrandom = "0.2"
 tiny_http = "0.12"
 zeroize = "1"
-bip39 = { version = "2", features = ["zeroize"] }
 rpassword = "7"

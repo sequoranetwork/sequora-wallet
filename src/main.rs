@@ -13,7 +13,7 @@ use bech32::{ToBase32, Variant};
 use fips204::ml_dsa_65;
 use fips204::traits::{KeyGen, SerDes, Signer};
 use sha2::{Digest, Sha256};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use base64::Engine;
@@ -130,13 +130,14 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, Stri
 
     let salt = rand_bytes(16);
     let nonce = rand_bytes(12);
-    let mut key = derive_key(password, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST);
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("cipher");
+    // Zeroizing<[u8;32]>: the Argon2id-derived key is scrubbed on EVERY exit path,
+    // including a panic during encrypt (audit LOW: key not zeroized on error paths).
+    let key = Zeroizing::new(derive_key(password, &salt, ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST));
+    let cipher = ChaCha20Poly1305::new_from_slice(&key[..]).expect("cipher");
     let mut seed_vec = seed.to_vec();
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&nonce), seed_vec.as_ref())
         .expect("encrypt");
-    key.zeroize(); // scrub the derived key
     seed_vec.zeroize(); // scrub the plaintext seed buffer
 
     let dir = key_path().parent().unwrap().to_path_buf();
@@ -275,8 +276,11 @@ fn load_keypair(pw: &str) -> (Vec<u8>, ml_dsa_65::PrivateKey) {
     let m = enc["m_cost"].as_u64().map(|v| v as u32).unwrap_or(ARGON2_DEFAULT_M);
     let t = enc["t_cost"].as_u64().map(|v| v as u32).unwrap_or(ARGON2_DEFAULT_T);
     let p = enc["p_cost"].as_u64().map(|v| v as u32).unwrap_or(ARGON2_DEFAULT_P);
-    let mut key = derive_key(pw, &salt, m, t, p);
-    let cipher = ChaCha20Poly1305::new_from_slice(&key).expect("cipher");
+    // Zeroizing: scrub the derived key on every path, incl. the wrong-password
+    // `.expect()` and the integrity `panic!` below (audit LOW: verify_password
+    // runs this under catch_unwind on every failed unlock).
+    let key = Zeroizing::new(derive_key(pw, &salt, m, t, p));
+    let cipher = ChaCha20Poly1305::new_from_slice(&key[..]).expect("cipher");
 
     let sk = if let Some(seed_ct) = enc["seed_ciphertext"].as_str() {
         // New seed-based wallet (has a recovery phrase): decrypt the 32-byte seed
@@ -309,8 +313,7 @@ fn load_keypair(pw: &str) -> (Vec<u8>, ml_dsa_65::PrivateKey) {
         sk_arr.zeroize();
         sk
     };
-    key.zeroize(); // scrub the derived key
-    (pubkey, sk)
+    (pubkey, sk) // `key` (Zeroizing) is scrubbed on drop
 }
 
 // proto-encode the custom pubkey message { bytes key = 1 } (the Any's value).
@@ -333,7 +336,10 @@ fn pubkey_any_value(pk: &[u8]) -> Vec<u8> {
     v
 }
 
-fn query_account(rest: &str, addr: &str) -> (u64, u64) {
+// query_account fetches (account_number, sequence) for the signing flow. The chain
+// REST endpoint is an untrusted dependency, so a down/slow/non-JSON response must
+// surface a clear error instead of panicking the worker thread. (audit LOW)
+fn query_account(rest: &str, addr: &str) -> Result<(u64, u64), String> {
     let url = format!(
         "{}/cosmos/auth/v1beta1/accounts/{}",
         rest.trim_end_matches('/'),
@@ -342,14 +348,31 @@ fn query_account(rest: &str, addr: &str) -> (u64, u64) {
     let body = ureq::get(&url)
         .timeout(std::time::Duration::from_secs(15))
         .call()
-        .expect("account query failed (is it funded?)")
+        .map_err(|e| format!("account query failed (is the chain REST API up and the account funded?): {e}"))?
         .into_string()
-        .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        .map_err(|e| format!("account query: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(&body).map_err(|_| "account query returned a non-JSON response".to_string())?;
     let acc = &v["account"];
     let an = acc["account_number"].as_str().unwrap_or("0").parse().unwrap_or(0);
     let sq = acc["sequence"].as_str().unwrap_or("0").parse().unwrap_or(0);
-    (an, sq)
+    Ok((an, sq))
+}
+
+// valid_amount: a positive integer micro-unit (usqr) amount. Rejects empty, zero,
+// negative, non-numeric and NaN before it is ever signed/broadcast. (audit LOW)
+fn valid_amount(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| b.is_ascii_digit())
+        && s.parse::<u128>().map(|n| n > 0).unwrap_or(false)
+}
+
+// valid_bech32: a well-formed bech32 string with the expected human-readable part.
+// Used to reject malformed recipient/validator addresses locally before signing,
+// and to neutralize any non-bech32 data a malicious REST node might return. (audit)
+fn valid_bech32(s: &str, hrp: &str) -> bool {
+    matches!(bech32::decode(s), Ok((h, _, _)) if h == hrp)
+        && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 // CLI helper: build+sign+broadcast and print the result (uses SQRWALLET_PASSWORD).
@@ -370,7 +393,7 @@ fn sign_and_broadcast(rest: &str, chain_id: &str, msg: Any, gas: u64, fee_usqr: 
 fn broadcast_msg(rest: &str, chain_id: &str, msg: Any, gas: u64, fee_usqr: u64, pw: &str) -> Result<(i64, String, String), String> {
     let (pubkey, sk) = load_keypair(pw);
     let from = derive_address(&pubkey);
-    let (acct_num, seq) = query_account(rest, &from);
+    let (acct_num, seq) = query_account(rest, &from)?;
 
     let body = TxBody {
         messages: vec![msg],
@@ -521,11 +544,21 @@ fn info_json(rest: &str) -> String {
     let myvaloper = derive_valoper(&load_pubkey());
     let vals = rest_get(rest, "/cosmos/staking/v1beta1/validators?pagination.limit=200");
     let val_arr = vals["validators"].as_array().cloned().unwrap_or_default();
+    // valoper feeds an onclick="stake('…')" JS-string-in-attribute context in the UI,
+    // where HTML-escaping alone does NOT prevent breakout. A well-behaved chain only
+    // ever returns bech32 operator addresses; sanitize to bech32 here so a malicious
+    // or compromised REST node cannot inject script via operator_address. (audit MED)
+    let clean_valoper = |v: &serde_json::Value| -> String {
+        match v.as_str() {
+            Some(s) if valid_bech32(s, "sqrvaloper") => s.to_string(),
+            _ => String::new(),
+        }
+    };
     let validators: Vec<serde_json::Value> = val_arr
         .iter()
         .map(|v| serde_json::json!({
             "moniker": v["description"]["moniker"],
-            "valoper": v["operator_address"],
+            "valoper": clean_valoper(&v["operator_address"]),
             "tokens": v["tokens"],
             "jailed": v["jailed"],
             "status": v["status"],
@@ -550,7 +583,7 @@ fn info_json(rest: &str) -> String {
         .cloned()
         .unwrap_or_default()
         .iter()
-        .map(|d| serde_json::json!({"valoper": d["delegation"]["validator_address"], "amount": d["balance"]["amount"]}))
+        .map(|d| serde_json::json!({"valoper": clean_valoper(&d["delegation"]["validator_address"]), "amount": d["balance"]["amount"]}))
         .collect();
     let rew = rest_get(rest, &format!("/cosmos/distribution/v1beta1/delegators/{addr}/rewards"));
     let rewards = rew["total"]
@@ -564,29 +597,44 @@ fn info_json(rest: &str) -> String {
 
 fn api_action(body: &str, rest: &str, chain_id: &str, kind: &str) -> (u16, &'static str, String) {
     let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
-    let pw = v["password"].as_str().unwrap_or("").to_string();
+    // Zeroizing: the plaintext password is scrubbed when this request finishes
+    // instead of lingering on the heap. (audit LOW)
+    let pw = Zeroizing::new(v["password"].as_str().unwrap_or("").to_string());
     let from = derive_address(&load_pubkey());
+    // Validate amount/recipient locally before signing: reject malformed input with a
+    // clear error instead of building, signing and broadcasting a bad tx. (audit LOW)
+    let bad = |m: &str| (200u16, "application/json", serde_json::json!({"error": m}).to_string());
     let (any, gas, fee): (Any, u64, u64) = match kind {
         "send" => {
+            let to = v["to"].as_str().unwrap_or("");
+            let amount = v["amount"].as_str().unwrap_or("0");
+            if !valid_bech32(to, "sqr") { return bad("invalid recipient address (expected an sqr1… address)"); }
+            if !valid_amount(amount) { return bad("invalid amount"); }
             let msg = MsgSend {
                 from_address: from,
-                to_address: v["to"].as_str().unwrap_or("").to_string(),
-                amount: vec![Coin { denom: "usqr".into(), amount: v["amount"].as_str().unwrap_or("0").to_string() }],
+                to_address: to.to_string(),
+                amount: vec![Coin { denom: "usqr".into(), amount: amount.to_string() }],
             };
             (Any { type_url: "/cosmos.bank.v1beta1.MsgSend".into(), value: msg.encode_to_vec() }, 400_000, 12_000)
         }
         "stake" => {
+            let valoper = v["valoper"].as_str().unwrap_or("");
+            let amount = v["amount"].as_str().unwrap_or("0");
+            if !valid_bech32(valoper, "sqrvaloper") { return bad("invalid validator address"); }
+            if !valid_amount(amount) { return bad("invalid amount"); }
             let msg = MsgDelegate {
                 delegator_address: from,
-                validator_address: v["valoper"].as_str().unwrap_or("").to_string(),
-                amount: Some(Coin { denom: "usqr".into(), amount: v["amount"].as_str().unwrap_or("0").to_string() }),
+                validator_address: valoper.to_string(),
+                amount: Some(Coin { denom: "usqr".into(), amount: amount.to_string() }),
             };
             (Any { type_url: "/cosmos.staking.v1beta1.MsgDelegate".into(), value: msg.encode_to_vec() }, 500_000, 15_000)
         }
         "claim" => {
+            let valoper = v["valoper"].as_str().unwrap_or("");
+            if !valid_bech32(valoper, "sqrvaloper") { return bad("invalid validator address"); }
             let msg = MsgWithdrawDelegatorReward {
                 delegator_address: from,
-                validator_address: v["valoper"].as_str().unwrap_or("").to_string(),
+                validator_address: valoper.to_string(),
             };
             (Any { type_url: "/cosmos.distribution.v1beta1.MsgWithdrawDelegatorReward".into(), value: msg.encode_to_vec() }, 300_000, 9_000)
         }
@@ -681,7 +729,7 @@ fn api_new(body: &str) -> (u16, &'static str, String) {
             return (200, "application/json", "{\"ok\":false,\"error\":\"key generation failed\"}".into());
         }
     };
-    let phrase = mnemonic.to_string();
+    let mut phrase = mnemonic.to_string();
     let mut seed = [0u8; 32];
     seed.copy_from_slice(&entropy);
     let res = save_wallet_from_seed(&seed, pw);
@@ -689,9 +737,17 @@ fn api_new(body: &str) -> (u16, &'static str, String) {
     entropy.zeroize();
     match res {
         // phrase is intentionally returned (shown once for the user to record offline);
-        // the mnemonic object is zeroized on drop (bip39 zeroize feature).
-        Ok(addr) => (200, "application/json", serde_json::json!({"ok": true, "address": addr, "mnemonic": phrase}).to_string()),
-        Err(e) => (200, "application/json", serde_json::json!({"ok": false, "error": e}).to_string()),
+        // the mnemonic object is zeroized on drop (bip39 zeroize feature). Build the
+        // response, then scrub this local copy too, matching api_restore. (audit LOW)
+        Ok(addr) => {
+            let out = serde_json::json!({"ok": true, "address": addr, "mnemonic": &phrase}).to_string();
+            phrase.zeroize();
+            (200, "application/json", out)
+        }
+        Err(e) => {
+            phrase.zeroize();
+            (200, "application/json", serde_json::json!({"ok": false, "error": e}).to_string())
+        }
     }
 }
 
@@ -773,6 +829,14 @@ fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
         format!("http://localhost:{port}"),
         format!("http://127.0.0.1:{port}"),
     ]);
+    // Host allowlist: rejecting an unexpected Host is the canonical DNS-rebinding
+    // defense and works even when Origin is absent. A page on attacker.com that
+    // rebinds its DNS to 127.0.0.1 still sends `Host: attacker.com`, so it is
+    // refused before it can scrape the CSRF token from GET / or call /api/*. (audit MED)
+    let allowed_hosts = std::sync::Arc::new(vec![
+        format!("localhost:{port}"),
+        format!("127.0.0.1:{port}"),
+    ]);
     let chain_id = chain_id.to_string();
     let rest = rest.to_string();
 
@@ -786,18 +850,23 @@ fn cmd_serve(port: u16, chain_id: &str, rest: &str) {
     std::panic::set_hook(Box::new(|_| {}));
 
     // Worker pool: handle requests concurrently so one slow chain-REST round-trip
-    // (or a slowloris client) can't block the whole UI. (SECURITY findings M3/M4.)
+    // doesn't block the whole UI. NOTE: tiny_http 0.12 exposes no per-socket read
+    // timeout, so a slowloris client trickling bytes can still pin the 8 workers
+    // until restart (audit MEDIUM, availability-only on a localhost single-user
+    // wallet; recovery is a process restart). A full fix needs a manual accept loop
+    // with TcpStream::set_read_timeout — tracked for a follow-up server rework.
     let workers = 8;
     let mut handles = Vec::new();
     for _ in 0..workers {
         let server = server.clone();
         let token = token.clone();
         let allowed = allowed_origins.clone();
+        let hosts = allowed_hosts.clone();
         let chain_id = chain_id.clone();
         let rest = rest.clone();
         handles.push(std::thread::spawn(move || loop {
             match server.recv() {
-                Ok(req) => handle_request(req, &token, &allowed, &chain_id, &rest),
+                Ok(req) => handle_request(req, &token, &allowed, &hosts, &chain_id, &rest),
                 Err(_) => break,
             }
         }));
@@ -813,9 +882,18 @@ const MAX_BODY: u64 = 64 * 1024;
 
 // handle_request processes ONE request on a worker thread: auth (token + origin
 // for /api/*), size-capped body read, routing, and the security headers.
-fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[String], chain_id: &str, rest: &str) {
+fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[String], allowed_hosts: &[String], chain_id: &str, rest: &str) {
     let method = req.method().clone();
     let url = req.url().to_string();
+    // DNS-rebinding defense: reject any request whose Host is not our loopback bind,
+    // on EVERY route (incl. GET / which inlines the CSRF token). A rebound attacker
+    // page sends its own hostname here and is refused. (audit MED)
+    let host_ok = header_value(&req, "Host").map(|h| allowed_hosts.iter().any(|a| a == &h)).unwrap_or(false);
+    if !host_ok {
+        let h = tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"text/plain"[..]).unwrap();
+        let _ = req.respond(tiny_http::Response::from_string("forbidden: bad Host").with_status_code(403).with_header(h));
+        return;
+    }
     let is_api = url.starts_with("/api/");
     if is_api {
         let tok_ok = header_value(&req, "X-Sequora-Token").map(|t| ct_eq(&t, token)).unwrap_or(false);
@@ -839,6 +917,7 @@ fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[S
         route(&method, &url, &body, chain_id, rest)
     }))
     .unwrap_or((500, "application/json", "{\"error\":\"wrong password or internal error\"}".to_string()));
+    body.zeroize(); // scrub the request body (it carries the plaintext password). (audit LOW)
 
     if url == "/" && ctype == "text/html" {
         out = out.replace("__CSRF_TOKEN__", token);
@@ -850,10 +929,15 @@ fn handle_request(mut req: tiny_http::Request, token: &str, allowed_origins: &[S
     resp.add_header(
         tiny_http::Header::from_bytes(
             &b"Content-Security-Policy"[..],
-            &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:"[..],
+            // frame-ancestors 'none' + X-Frame-Options below make the wallet
+            // unframeable, so the lock/create screens can't be clickjacked. (audit LOW)
+            &b"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'none'"[..],
         )
         .unwrap(),
     );
+    resp.add_header(tiny_http::Header::from_bytes(&b"X-Frame-Options"[..], &b"DENY"[..]).unwrap());
+    resp.add_header(tiny_http::Header::from_bytes(&b"X-Content-Type-Options"[..], &b"nosniff"[..]).unwrap());
+    resp.add_header(tiny_http::Header::from_bytes(&b"Referrer-Policy"[..], &b"no-referrer"[..]).unwrap());
     let _ = req.respond(resp);
 }
 
@@ -991,7 +1075,12 @@ input:focus{border-color:var(--ac)}
 const TOKEN='__CSRF_TOKEN__';
 const $=id=>document.getElementById(id);
 const sqr=u=>(parseInt(u||0)/1e6).toLocaleString(undefined,{maximumFractionDigits:6});
-const usqr=s=>Math.round(parseFloat(s||'0')*1e6).toString();
+// toUsqr converts a typed SQR amount to integer micro-units using BigInt string
+// math (NOT float) so the value shown in the confirm modal is EXACTLY the value
+// signed (WYSIWYS). Returns null for empty/zero/negative/NaN/>6-decimal input.
+const toUsqr=s=>{s=String(s==null?'':s).trim();if(!/^\d+(\.\d{1,6})?$/.test(s))return null;const p=s.split('.');const f=((p[1]||'')+'000000').slice(0,6);const v=BigInt(p[0])*1000000n+BigInt(f||'0');return v>0n?v.toString():null};
+// fmtUsqr renders integer micro-units back to a canonical SQR string for display.
+const fmtUsqr=u=>{const n=BigInt(u);const i=(n/1000000n).toString();const f=(n%1000000n).toString().padStart(6,'0').replace(/0+$/,'');return f?i+'.'+f:i};
 // HTML-escape on-chain data (e.g. validator monikers) before it touches innerHTML.
 // This is the real XSS defense — without it a validator could set a moniker like
 // "<img onerror=...>" and run script that reads your in-memory password.
@@ -1075,7 +1164,7 @@ async function refresh(){
   let d=await resp.json();
   if(!d||!d.address){return}
   ADDR=d.address;
-  $('addr').innerHTML=d.address.slice(0,14)+'…'+d.address.slice(-6)+' ⧉';
+  $('addr').textContent=d.address.slice(0,14)+'…'+d.address.slice(-6)+' ⧉';
   $('bal').textContent=sqr(d.balance);$('bal2').textContent=sqr(d.balance);$('rew').textContent=sqr(d.rewards);
   $('vals').innerHTML=d.validators.map(v=>`<div class="vrow"><div class="coin" style="width:34px;height:34px;font-size:11px">V</div><div><div class="vn">${esc(v.moniker)}</div><div class="vs">${sqr(v.tokens)} SQR staked</div></div><div style="margin-left:auto;display:flex;gap:6px"><input id="amt_${esc(v.valoper)}" placeholder="SQR" style="width:78px;padding:8px"><button class="btn sm" onclick="stake('${esc(v.valoper)}')">Stake</button></div></div>`).join('')||'<div class="vs">none</div>';
   $('dels').innerHTML=d.delegations.map(x=>`<div class="vrow"><div><div class="vn">${sqr(x.amount)} SQR</div><div class="vs">${esc(x.valoper).slice(0,20)}…</div></div><button class="btn sm alt" style="margin-left:auto" onclick="claim('${esc(x.valoper)}')">Claim</button></div>`).join('')||'<div class="vs">no delegations yet</div>';
@@ -1113,13 +1202,17 @@ function cancelConfirm(){$('confirm').classList.add('hide');pendingTx=null}
 function doConfirm(){const t=pendingTx;pendingTx=null;$('confirm').classList.add('hide');if(t)post(t.path,t.obj,t.label)}
 function send(){
   const to=$('sendTo').value.trim(),a=$('sendAmt').value.trim();
-  if(!to||!a){toast('err','Send','enter a recipient and amount');return}
-  confirmTx('Send SQR',[['To',to],['Amount',a+' SQR'],['Network fee','~0.012 SQR']],'/api/send',{to:to,amount:usqr(a)});
+  if(!to){toast('err','Send','enter a recipient');return}
+  if(!/^sqr1[a-z0-9]+$/.test(to)){toast('err','Send','that is not a valid Sequora (sqr1…) address');return}
+  const u=toUsqr(a);
+  if(!u){toast('err','Send','enter a valid amount (max 6 decimals)');return}
+  // Display fmtUsqr(u): the exact micro-unit value that gets signed (WYSIWYS).
+  confirmTx('Send SQR',[['To',to],['Amount',fmtUsqr(u)+' SQR'],['Network fee','~0.012 SQR']],'/api/send',{to:to,amount:u});
 }
 function stake(v){
-  const a=($('amt_'+v).value||'').trim();
-  if(!a){toast('err','Stake','enter an amount');return}
-  confirmTx('Stake (delegate)',[['Validator',v.slice(0,16)+'…'+v.slice(-6)],['Amount',a+' SQR'],['Network fee','~0.015 SQR']],'/api/stake',{valoper:v,amount:usqr(a)});
+  const u=toUsqr(($('amt_'+v).value||'').trim());
+  if(!u){toast('err','Stake','enter a valid amount (max 6 decimals)');return}
+  confirmTx('Stake (delegate)',[['Validator',v.slice(0,16)+'…'+v.slice(-6)],['Amount',fmtUsqr(u)+' SQR'],['Network fee','~0.015 SQR']],'/api/stake',{valoper:v,amount:u});
 }
 function claim(v){confirmTx('Claim staking rewards',[['From validator',v.slice(0,16)+'…'+v.slice(-6)],['Network fee','~0.009 SQR']],'/api/claim',{valoper:v})}
 function unjail(){confirmTx('Unjail your validator',[['Action','remove downtime jail'],['Network fee','~0.006 SQR']],'/api/unjail',{})}

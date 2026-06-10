@@ -16,4 +16,7 @@ jobs:
       - name: install cargo-audit
         run: cargo install cargo-audit --locked
       - name: cargo audit
-        run: cargo audit
+        # --deny warnings also fails the gate on informational advisories
+        # (unmaintained / unsound / yanked crates), not just vulnerabilities — an
+        # abandoned transitive crate is a prime supply-chain risk. (audit LOW)
+        run: cargo audit --deny warnings
