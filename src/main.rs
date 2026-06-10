@@ -888,7 +888,6 @@ input:focus{border-color:var(--ac)}
 <div id="lock"><div class="box">
   <div class="logo"></div>
   <h1>Sequora</h1>
-  <div class="tag">post-quantum wallet · enter your password to unlock</div>
   <div style="position:relative">
     <input id="lpw" type="password" placeholder="password" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" onkeydown="if(event.key==='Enter')unlock()">
     <span id="eye" onclick="toggleEye()" style="position:absolute;right:12px;top:50%;transform:translateY(-50%);cursor:pointer;user-select:none;font-size:15px;opacity:.65" title="show / hide">show</span>
