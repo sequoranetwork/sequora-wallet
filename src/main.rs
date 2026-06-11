@@ -6,7 +6,6 @@
 use std::env;
 use std::fs;
 use std::io::Read;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 
 use bech32::{ToBase32, Variant};
@@ -36,9 +35,42 @@ use prost::Message;
 const HRP: &str = "sqr";
 const DENOM: &str = "usqr";
 
+// Cross-platform home directory: $HOME (Unix) or %USERPROFILE% (Windows).
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
 fn key_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".into());
-    PathBuf::from(home).join(".sequora-wallet").join("key.json")
+    home_dir().join(".sequora-wallet").join("key.json")
+}
+
+// Create a directory (recursively) restricted to the owner: mode 0700 on Unix.
+// On Windows the directory inherits the user's default ACL (already private).
+fn create_owner_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    let mut b = fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir)
+}
+
+// Create/truncate a file for owner-only read+write: mode 0600 on Unix; on Windows
+// the file inherits the user's default ACL.
+fn create_owner_file(path: &std::path::Path) -> std::io::Result<fs::File> {
+    let mut o = fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(path)
 }
 
 // --- key-at-rest encryption (Argon2id KDF + ChaCha20-Poly1305 AEAD) ---
@@ -141,8 +173,8 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, Stri
     seed_vec.zeroize(); // scrub the plaintext seed buffer
 
     let dir = key_path().parent().unwrap().to_path_buf();
-    // dir 0700: only the owner may traverse ~/.sequora-wallet
-    fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir).unwrap();
+    // owner-only dir (0700 on Unix; default user ACL on Windows)
+    create_owner_dir(&dir).unwrap();
     let json = serde_json::json!({
         "scheme": "ML-DSA-65",
         "pubkey": hex::encode(&pk_bytes),
@@ -158,14 +190,8 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, Stri
             "seed_ciphertext": hex::encode(&ciphertext),
         }
     });
-    // file 0600 from creation (no world-readable TOCTOU window). See finding H2.
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(key_path())
-        .unwrap();
+    // file 0600 from creation on Unix (no world-readable TOCTOU window). See finding H2.
+    let mut f = create_owner_file(&key_path()).unwrap();
     use std::io::Write as _;
     f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes()).unwrap();
     Ok(addr)
@@ -805,9 +831,9 @@ fn load_or_create_token() -> String {
     }
     let tok = hex::encode(rand_bytes(32));
     if let Some(dir) = p.parent() {
-        let _ = fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        let _ = create_owner_dir(dir);
     }
-    if let Ok(mut f) = fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&p) {
+    if let Ok(mut f) = create_owner_file(&p) {
         use std::io::Write as _;
         let _ = f.write_all(tok.as_bytes());
     }
