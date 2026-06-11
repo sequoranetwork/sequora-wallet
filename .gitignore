@@ -1,1 +1,19 @@
 target/
+
+# --- secrets: never commit key material (defense-in-depth) ---
+key.json
+*.mnemonic
+*.bak
+.env
+*.pem
+*.key
+.sequora-wallet/
+
+# --- local scratch / editor / assistant artifacts ---
+_*.sh
+*.tmp
+.DS_Store
+.idea/
+.vscode/
+CLAUDE.md
+.claude/
