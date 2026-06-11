@@ -1226,39 +1226,39 @@ fn main() {
         "new" => cmd_new(),
         "restore" => cmd_restore(),
         "address" => cmd_address(),
-        "balance" => cmd_balance(args.get(2).map(String::as_str).unwrap_or("http://localhost:1317")),
+        "balance" => cmd_balance(args.get(2).map(String::as_str).unwrap_or("https://api.sequora.tech")),
         "sign" => cmd_sign(args.get(2).map(String::as_str).unwrap_or("hello-sequora")),
         "serve" => {
             let port: u16 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(8088);
-            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-wasm");
-            let rest = args.get(4).map(String::as_str).unwrap_or("http://localhost:1317");
+            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-testnet-1");
+            let rest = args.get(4).map(String::as_str).unwrap_or("https://api.sequora.tech");
             cmd_serve(port, chain_id, rest);
         }
         "stake" => {
             let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet stake <valoper> <amount> [chain_id] [rest_url]");
             let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet stake <valoper> <amount> [chain_id] [rest_url]");
-            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
-            let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-testnet-1");
+            let rest = args.get(5).map(String::as_str).unwrap_or("https://api.sequora.tech");
             cmd_stake(rest, chain_id, valoper, amount);
         }
         "send" => {
             let to = args.get(2).map(String::as_str).expect("usage: sqrwallet send <to_addr> <amount> [chain_id] [rest_url]");
             let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet send <to_addr> <amount> [chain_id] [rest_url]");
-            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
-            let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-testnet-1");
+            let rest = args.get(5).map(String::as_str).unwrap_or("https://api.sequora.tech");
             cmd_send(rest, chain_id, to, amount);
         }
         "claim" => {
             let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet claim <valoper> [chain_id] [rest_url]");
-            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-wasm");
-            let rest = args.get(4).map(String::as_str).unwrap_or("http://localhost:1317");
+            let chain_id = args.get(3).map(String::as_str).unwrap_or("sequora-testnet-1");
+            let rest = args.get(4).map(String::as_str).unwrap_or("https://api.sequora.tech");
             cmd_claim(rest, chain_id, valoper);
         }
         "unstake" => {
             let valoper = args.get(2).map(String::as_str).expect("usage: sqrwallet unstake <valoper> <amount> [chain_id] [rest_url]");
             let amount = args.get(3).map(String::as_str).expect("usage: sqrwallet unstake <valoper> <amount> [chain_id] [rest_url]");
-            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-wasm");
-            let rest = args.get(5).map(String::as_str).unwrap_or("http://localhost:1317");
+            let chain_id = args.get(4).map(String::as_str).unwrap_or("sequora-testnet-1");
+            let rest = args.get(5).map(String::as_str).unwrap_or("https://api.sequora.tech");
             cmd_unstake(rest, chain_id, valoper, amount);
         }
         _ => {
