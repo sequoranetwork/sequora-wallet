@@ -57,7 +57,16 @@ fn create_owner_dir(dir: &std::path::Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(dir)
+    b.create(dir)?;
+    // Enforce 0700 even when the directory ALREADY existed: DirBuilder.mode only
+    // applies at creation time, so a dir made under a looser umask keeps its old
+    // (possibly world-readable) perms. This self-heals wallets from earlier builds.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 // Create/truncate a file for owner-only read+write: mode 0600 on Unix; on Windows
@@ -70,7 +79,16 @@ fn create_owner_file(path: &std::path::Path) -> std::io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
-    o.open(path)
+    let f = o.open(path)?;
+    // Enforce 0600 even when the file ALREADY existed: OpenOptions.mode only applies
+    // when the inode is first created — re-opening + truncating an existing key.json
+    // leaves its old (possibly world-readable 0644) perms. Self-heals older wallets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(f)
 }
 
 // --- key-at-rest encryption (Argon2id KDF + ChaCha20-Poly1305 AEAD) ---
@@ -144,8 +162,8 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, Stri
     let addr = derive_address(&pk_bytes);
 
     // Never silently destroy an existing wallet: if key.json is present, back it
-    // up (0600 perms are preserved by the copy) before overwriting. A mistaken
-    // `new`/restore is then recoverable. (audit: destructive /api/restore)
+    // up before overwriting. A mistaken `new`/restore is then recoverable.
+    // (audit: destructive /api/restore)
     if key_path().exists() {
         // Back up the existing key to a UNIQUE timestamped file BEFORE overwriting,
         // and ABORT if the backup fails — never destroy the only copy of a funded
@@ -157,6 +175,15 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, Stri
         let bak = key_path().with_extension(format!("json.{}.bak", ts));
         if let Err(e) = fs::copy(key_path(), &bak) {
             return Err(format!("refusing to overwrite existing wallet: backup to {} failed: {}", bak.display(), e));
+        }
+        // fs::copy creates the backup under the process umask (typically 0644), NOT
+        // the source's 0600 — explicitly restrict it so backups of the encrypted
+        // seed aren't world-readable. (audit MED: world-readable key backups)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&bak, fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("failed to secure backup perms on {}: {}", bak.display(), e))?;
         }
     }
 
@@ -190,7 +217,8 @@ fn save_wallet_from_seed(seed: &[u8; 32], password: &str) -> Result<String, Stri
             "seed_ciphertext": hex::encode(&ciphertext),
         }
     });
-    // file 0600 from creation on Unix (no world-readable TOCTOU window). See finding H2.
+    // file forced to 0600 on Unix (created at 0600, and re-enforced if it already
+    // existed so an older world-readable key.json is healed). See finding H2.
     let mut f = create_owner_file(&key_path()).unwrap();
     use std::io::Write as _;
     f.write_all(serde_json::to_string_pretty(&json).unwrap().as_bytes()).unwrap();
