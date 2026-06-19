@@ -319,6 +319,14 @@ fn cmd_balance(rest: &str) {
 }
 
 fn load_keypair(pw: &str) -> (Vec<u8>, ml_dsa_65::PrivateKey) {
+    // Self-heal: re-assert owner-only (0600) on read, in case the key file was
+    // created/copied with looser permissions out-of-band. Writes already enforce
+    // this; readers did not. Best-effort. (audit LOW)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(key_path(), fs::Permissions::from_mode(0o600));
+    }
     let data = fs::read_to_string(key_path()).expect("no wallet — run `sqrwallet new`");
     let v: serde_json::Value = serde_json::from_str(&data).expect("corrupt key file");
     let pubkey = hex::decode(v["pubkey"].as_str().unwrap()).unwrap();
@@ -586,6 +594,81 @@ fn rest_get(rest: &str, path: &str) -> serde_json::Value {
     }
 }
 
+// Percent-encode a tx-search query value (RFC 3986 unreserved chars pass through).
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+// history_json returns this wallet's recent transfers (sent + received) by searching
+// the chain's tx index (the node runs with tx_index=on). It runs two searches —
+// message.sender=<me> and transfer.recipient=<me> — keeps only bank MsgSend, dedups,
+// and sorts newest-first. The REST node is untrusted, so a down/garbage response just
+// yields an empty list (rest_get already swallows errors); addresses are bech32 and
+// re-checked client-side before display.
+fn history_json(rest: &str) -> String {
+    let addr = derive_address(&load_pubkey());
+    let q = |query: String| -> serde_json::Value {
+        let path = format!(
+            "/cosmos/tx/v1beta1/txs?query={}&order_by=ORDER_BY_DESC&pagination.limit=25",
+            pct(&query)
+        );
+        rest_get(rest, &path)
+    };
+    let responses = [
+        q(format!("message.sender='{}'", addr)),
+        q(format!("transfer.recipient='{}'", addr)),
+    ];
+    let mut seen = std::collections::HashSet::new();
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    for resp in &responses {
+        let txs = resp["txs"].as_array().cloned().unwrap_or_default();
+        let trs = resp["tx_responses"].as_array().cloned().unwrap_or_default();
+        for (i, tx) in txs.iter().enumerate() {
+            let tr = trs.get(i).cloned().unwrap_or(serde_json::json!({}));
+            let hash = tr["txhash"].as_str().unwrap_or("").to_string();
+            let height = tr["height"].as_str().unwrap_or("0").to_string();
+            let time = tr["timestamp"].as_str().unwrap_or("").to_string();
+            let ok = tr["code"].as_i64().unwrap_or(0) == 0;
+            for m in tx["body"]["messages"].as_array().cloned().unwrap_or_default() {
+                if m["@type"].as_str() != Some("/cosmos.bank.v1beta1.MsgSend") {
+                    continue;
+                }
+                let from = m["from_address"].as_str().unwrap_or("");
+                let to = m["to_address"].as_str().unwrap_or("");
+                let amount = m["amount"][0]["amount"].as_str().unwrap_or("0").to_string();
+                let (dir, other) = if from == addr {
+                    ("sent", to.to_string())
+                } else if to == addr {
+                    ("received", from.to_string())
+                } else {
+                    continue;
+                };
+                if !seen.insert(format!("{}|{}|{}", hash, dir, other)) {
+                    continue;
+                }
+                items.push(serde_json::json!({
+                    "hash": hash.clone(), "height": height.clone(), "time": time.clone(),
+                    "ok": ok, "dir": dir, "other": other, "amount": amount,
+                }));
+            }
+        }
+    }
+    items.sort_by(|a, b| {
+        let ha: u64 = a["height"].as_str().unwrap_or("0").parse().unwrap_or(0);
+        let hb: u64 = b["height"].as_str().unwrap_or("0").parse().unwrap_or(0);
+        hb.cmp(&ha)
+    });
+    items.truncate(25);
+    serde_json::json!({ "txs": items }).to_string()
+}
+
 fn info_json(rest: &str) -> String {
     let addr = derive_address(&load_pubkey());
     let bal = rest_get(rest, &format!("/cosmos/bank/v1beta1/balances/{addr}"));
@@ -809,6 +892,7 @@ fn route(method: &tiny_http::Method, url: &str, body: &str, chain_id: &str, rest
     match (method, url) {
         (tiny_http::Method::Get, "/") => (200, "text/html", DASHBOARD_HTML.to_string()),
         (tiny_http::Method::Get, "/api/info") => (200, "application/json", info_json(rest)),
+        (tiny_http::Method::Get, "/api/history") => (200, "application/json", history_json(rest)),
         (tiny_http::Method::Post, "/api/unlock") => api_unlock(body),
         (tiny_http::Method::Post, "/api/new") => api_new(body),
         (tiny_http::Method::Post, "/api/restore") => api_restore(body),
@@ -1106,6 +1190,7 @@ input:focus{border-color:var(--ac)}
      <label>Recipient address</label><input id="sendTo" placeholder="sqr1…">
      <label>Amount (SQR)</label><input id="sendAmt" placeholder="0.00" inputmode="decimal">
      <button class="btn" onclick="send()">Send SQR</button></div>
+   <div class="card"><h3>Recent activity</h3><div id="hist"><div class="vs">loading…</div></div></div>
  </div>
  <div id="vs2" class="hide">
    <div class="card"><h3>Staking rewards</h3><div class="asset"><div class="coin">+</div><div><div class="nm"><span id="rew">0</span> SQR</div><div class="sub">pending across delegations</div></div></div></div>
@@ -1234,6 +1319,25 @@ async function refresh(){
     $('myval').innerHTML='<div class="vs">This wallet is not operating a validator.<br>To run one, use the setup wizard (<code>scripts/validator-wizard.sh</code>) — this wallet would be the operator key. Your valoper address:<br><span style="font-family:ui-monospace,monospace;font-size:10px">'+esc(d.myvaloper||'')+'</span></div>';
   }
   $('netvals').innerHTML=(d.validators||[]).map(function(v){var bs=v.jailed===true?'<span style="color:#ff7a7a;font-size:10px">JAILED</span>':badge(v.status);return '<div class="vrow"><div class="coin" style="width:30px;height:30px;font-size:10px">V</div><div><div class="vn">'+esc(v.moniker)+' '+bs+'</div><div class="vs">'+sqr(v.tokens)+' SQR · '+(parseFloat(v.commission||0)*100).toFixed(1)+'% commission</div></div></div>'}).join('')||'<div class="vs">none</div>';
+  loadHistory();
+}
+async function loadHistory(){
+  try{
+    const r=await fetch('/api/history',{headers:{'X-Sequora-Token':TOKEN}});
+    if(!r.ok)return;
+    const tx=((await r.json()).txs)||[];
+    $('hist').innerHTML=tx.map(function(t){
+      const inb=t.dir==='received';
+      const col=inb?'#5fe0a0':'#ffb070';
+      const arrow=inb?'▼':'▲';
+      const verb=inb?'Received':'Sent';
+      const prep=inb?'from':'to';
+      const o=esc(t.other||'');
+      const short=o.length>20?o.slice(0,12)+'…'+o.slice(-6):o;
+      const fail=t.ok?'':' <span style="color:#ff7a7a">(failed)</span>';
+      return '<div class="vrow"><div style="color:'+col+';font-weight:700;width:16px">'+arrow+'</div><div><div class="vn">'+verb+' '+sqr(t.amount)+' SQR'+fail+'</div><div class="vs">'+prep+' '+short+' · block '+esc(t.height)+'</div></div></div>';
+    }).join('')||'<div class="vs">no transactions yet</div>';
+  }catch(e){}
 }
 async function post(path,obj,label){
   if(!PW){lock();return}
